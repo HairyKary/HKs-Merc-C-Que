@@ -1,8 +1,8 @@
-# HKs Merc-C-QUE
+# HKs Merc-C-Que
 
 **A chain queue organizer for Torn.com**
 
-HKs Merc-C-QUE helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
+HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Beta  
 > **Current beta:** v2.1.1  
@@ -38,17 +38,17 @@ HKs Merc-C-QUE helps faction chain coordinators keep an ordered rotation of hitt
 ### Install from GitHub
 
 1. Open the raw userscript:  
-   `https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js`
+   `https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
 2. Tampermonkey should open an installation screen.
 3. Click **Install**.
 4. Refresh Torn.
 
-If Tampermonkey does not open automatically, create a new userscript and paste the contents of `HKs-Merc-C-QUE.user.js`.
+If Tampermonkey does not open automatically, create a new userscript and paste the contents of `HKs-Merc-C-Que.user.js`.
 
 ## First Setup
 
 1. Open Torn.
-2. Find the **HKs Merc-C-QUE** floating panel.
+2. Find the **HKs Merc-C-Que** floating panel.
 3. Click the **gear icon**.
 4. Paste your queue roster, one Torn username per line.
 5. Click **Save Roster**.
@@ -60,10 +60,10 @@ If Tampermonkey does not open automatically, create a new userscript and paste t
 No recurring API calls are made. Use **DONE** after the current person completes their hit.
 
 ### Assisted
-Merc-C-QUE watches faction attack data and alerts you when a hit is detected. You confirm the queue advancement.
+Merc-C-Que watches faction attack data and alerts you when a hit is detected. You confirm the queue advancement.
 
 ### Auto
-When the expected **UP NOW** player makes a detected chain hit, Merc-C-QUE records the hit and advances the queue automatically.
+When the expected **UP NOW** player makes a detected chain hit, Merc-C-Que records the hit and advances the queue automatically.
 
 Unexpected or out-of-order hits still require manual confirmation.
 
@@ -100,7 +100,7 @@ See [TESTING.md](TESTING.md) for the test checklist.
 
 Open a GitHub Issue and include:
 
-- Merc-C-QUE version
+- Merc-C-Que version
 - Browser
 - Userscript manager/version
 - API mode being used
@@ -116,4 +116,4 @@ This is an unofficial third-party userscript. Test beta versions carefully. Torn
 
 ## Author
 
-Created by **HairyKary** for The Mercs community.
+Created by **HairyKary** for... why not, I just hope its liked.
