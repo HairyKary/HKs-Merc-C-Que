@@ -1,0 +1,11 @@
+Replace YOUR_GITHUB_USERNAME with your GitHub username.
+
+Add these lines to the userscript metadata block:
+
+// @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE
+// @supportURL   https://github.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/issues
+// @updateURL    https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
+// @downloadURL  https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
+
+Recommended filename:
+HKs-Merc-C-QUE.user.js
