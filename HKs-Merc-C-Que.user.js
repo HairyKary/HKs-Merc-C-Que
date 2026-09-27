@@ -1,8 +1,8 @@
 // ==UserScript==
-// @homepageURL  https://github.com/HairyKary/HKs-Merc-C-QUE
-// @supportURL   https://github.com/HairyKary/HKs-Merc-C-QUE/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
+// @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
+// @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
 // @name         HKs Merc-C-QUE
 // @namespace    hks-merc-c-que
 // @version      2.1.1
