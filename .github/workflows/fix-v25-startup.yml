@@ -1,0 +1,42 @@
+name: Fix v2.5 startup initialization
+
+on:
+  push:
+    branches:
+      - v2.5-pda-resilience
+    paths:
+      - .github/workflows/fix-v25-startup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5-pda-resilience
+      - name: Patch startup helper order
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('HKs-Merc-C-Que.user.js')
+          text = path.read_text(encoding='utf-8')
+          old = "  const clone = value => JSON.parse(JSON.stringify(value));"
+          new = "  function clone(value) { return JSON.parse(JSON.stringify(value)); }"
+          if old not in text:
+              raise SystemExit('Expected clone declaration not found')
+          text = text.replace(old, new, 1)
+          text = text.replace('// @version      2.5.0', '// @version      2.5.1', 1)
+          text = text.replace("const VERSION = '2.5.0';", "const VERSION = '2.5.1';", 1)
+          path.write_text(text, encoding='utf-8')
+      - name: Verify JavaScript syntax
+        run: node --check HKs-Merc-C-Que.user.js
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HKs-Merc-C-Que.user.js
+          git commit -m "Fix v2.5 startup initialization order"
+          git push origin v2.5-pda-resilience
