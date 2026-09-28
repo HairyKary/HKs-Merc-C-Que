@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Beta  
-> **Current beta:** v2.1.1  
+> **Current beta:** v2.2.0  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
 ## Features
@@ -24,6 +24,9 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Customizable faction-chat message
 - One-click copy to clipboard
 - Scrollable floating panel
+- Minimize to a compact draggable **MCQ** launcher
+- Minimized launcher remembers its screen position
+- Pending-hit badge while minimized
 - Dark/light friendly interface
 - Local queue persistence between page refreshes
 
@@ -53,6 +56,14 @@ If Tampermonkey does not open automatically, create a new userscript and paste t
 4. Paste your queue roster, one Torn username per line.
 5. Click **Save Roster**.
 6. Choose Manual, Assisted, or Auto mode.
+
+## Minimize / Restore
+
+Click the **—** button in the Merc-C-Que header to minimize the panel.
+
+Merc-C-Que becomes a small **MCQ** launcher that can be dragged anywhere on the screen. Its position is remembered after refresh. Click the launcher to restore the full panel.
+
+If Assisted or Auto mode has a detected hit waiting for attention, the minimized launcher shows a badge with the number of pending hits.
 
 ## API Modes
 
