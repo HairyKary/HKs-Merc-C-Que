@@ -17,8 +17,12 @@
 - [ ] Toggle AFK -> READY
 - [ ] Remove a user with X
 - [ ] Refresh Torn and confirm the queue is preserved
-- [ ] Collapse and reopen the panel
 - [ ] Move the floating panel
+- [ ] Minimize the panel with the — button
+- [ ] Drag the MCQ launcher to a new screen position
+- [ ] Click MCQ to restore the panel
+- [ ] Refresh while minimized and confirm the launcher position is preserved
+- [ ] Confirm pending-hit badge appears on MCQ when a hit needs attention
 
 ## Manual Mode
 
@@ -60,6 +64,7 @@
 
 - [ ] Panel scrolls when settings exceed screen height
 - [ ] Header remains accessible
+- [ ] Minimized launcher does not interfere with Torn chat after being positioned
 - [ ] Dark mode is readable
 - [ ] Light mode is readable
 - [ ] No important buttons are cut off
