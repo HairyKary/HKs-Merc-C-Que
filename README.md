@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Beta  
-> **Current beta:** v2.2.0  
+> **Current beta:** v2.4.0  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
 ## Features
@@ -18,16 +18,22 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Remove players who leave the queue
 - Manual, Assisted, and Auto API modes
 - Automatic detection of faction chain hits
-- Out-of-order hit warnings
-- Per-player hit counts
+- Out-of-order and unqueued-hit warnings
+- Per-player completed hit counts
 - Undo and Skip controls
+- Auto-mode undo that reverses the local queue change without re-detecting the same Torn hit
 - Customizable faction-chat message
 - One-click copy to clipboard
 - Scrollable floating panel
-- Minimize to a compact draggable **MCQ** launcher
+- Minimize to a compact draggable **MCQ #hit** launcher
 - Minimized launcher remembers its screen position
+- Launcher status indicator for API active / paused / pending attention
 - Pending-hit badge while minimized
+- Tabbed settings for **Roster / Message / API / History**
+- Event history / diagnostics ledger
+- Copyable debug snapshot that excludes the API key
 - Dark/light friendly interface
+- Versioned saved-state migration
 - Local queue persistence between page refreshes
 
 ## Installation
@@ -53,30 +59,46 @@ If Tampermonkey does not open automatically, create a new userscript and paste t
 1. Open Torn.
 2. Find the **HKs Merc-C-Que** floating panel.
 3. Click the **gear icon**.
-4. Paste your queue roster, one Torn username per line.
-5. Click **Save Roster**.
-6. Choose Manual, Assisted, or Auto mode.
+4. Open the **ROSTER** tab.
+5. Paste your queue roster, one Torn username per line.
+6. Click **Save Roster**.
+7. Open the **API** tab if you want Assisted or Auto mode.
 
 ## Minimize / Restore
 
 Click the **—** button in the Merc-C-Que header to minimize the panel.
 
-Merc-C-Que becomes a small **MCQ** launcher that can be dragged anywhere on the screen. Its position is remembered after refresh. Click the launcher to restore the full panel.
+Merc-C-Que becomes a small draggable launcher showing the next assigned hit number, for example `MCQ #427`. Its position is remembered after refresh. Click the launcher to restore the full panel.
 
-If Assisted or Auto mode has a detected hit waiting for attention, the minimized launcher shows a badge with the number of pending hits.
+The launcher status dot indicates whether API automation is active, paused, or waiting for attention. Pending Assisted / out-of-order / unqueued hits also show a badge count.
 
 ## API Modes
 
 ### Manual
+
 No recurring API calls are made. Use **DONE** after the current person completes their hit.
 
 ### Assisted
+
 Merc-C-Que watches faction attack data and alerts you when a hit is detected. You confirm the queue advancement.
 
 ### Auto
+
 When the expected **UP NOW** player makes a detected chain hit, Merc-C-Que records the hit and advances the queue automatically.
 
 Unexpected or out-of-order hits still require manual confirmation.
+
+## Undo Behavior
+
+Merc-C-Que keeps local queue history for manual and API-driven queue changes.
+
+For an Auto-mode hit, **UNDO** restores the prior Merc-C-Que roster / hit-count state but deliberately leaves the Torn attack marked as processed. The actual Torn hit still happened, so Merc-C-Que will not immediately detect and apply the same attack a second time.
+
+## Event History / Diagnostics
+
+Open **Settings → HISTORY** to view recent Merc-C-Que events, including detected hits, Auto recordings, confirmations, ignored hits, and undone events.
+
+**COPY DEBUG SNAPSHOT** copies a compact diagnostic record containing queue state, chain state, pending hits, and recent event history. The saved Torn API key is not included.
 
 ## API Key Safety
 
@@ -118,8 +140,9 @@ Open a GitHub Issue and include:
 - What you expected
 - What happened instead
 - Steps to reproduce the problem
+- A debug snapshot when useful
 
-**Remove API keys and private information before posting screenshots or logs.**
+**Remove private information before posting screenshots or logs. The built-in debug snapshot does not include your saved API key.**
 
 ## Disclaimer
 
@@ -127,4 +150,4 @@ This is an unofficial third-party userscript. Test beta versions carefully. Torn
 
 ## Author
 
-Created by **HairyKary** for... why not, I just hope its liked.
+Created by **HairyKary**.
