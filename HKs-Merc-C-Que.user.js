@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.4.0
-// @description  Torn faction chain queue organizer with Manual, Assisted, and Auto API modes.
+// @version      2.5.0
+// @description  Torn faction chain queue organizer with Manual, Assisted, Auto API modes, and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -21,20 +21,25 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.4.0';
-  const SCHEMA_VERSION = 4;
+  const VERSION = '2.5.0';
+  const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
   const API_KEY_STORE = 'hksMercCQue_apiKey';
+  const API_KEY_FALLBACK_STORE = 'hksMercCQue_apiKey_fallback';
   const PANEL_ID = 'hkmcq-panel';
   const LAUNCHER_ID = 'hkmcq-launcher';
   const STYLE_ID = 'hkmcq-style';
   const TOAST_ID = 'hkmcq-toast';
   const API_BASE = 'https://api.torn.com/v2';
+  const PDA_API_KEY_LITERAL = '###PDA-APIKEY###';
   const MAX_HISTORY = 40;
-  const MAX_PROCESSED = 150;
-  const MAX_PENDING = 30;
-  const MAX_LEDGER = 150;
+  const MAX_PROCESSED = 300;
+  const MAX_PENDING = 50;
+  const MAX_LEDGER = 200;
+  const DANGER_SECONDS = 60;
+  const CRITICAL_SECONDS = 30;
+  const DEFAULT_WAIT_WARNING_SECONDS = 240;
   const DEFAULT_TEMPLATE =
     'HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})';
 
@@ -48,10 +53,15 @@
     settingsTab: 'roster',
     position: null,
     launcherPosition: null,
+    ui: {
+      soundAlerts: false,
+      waitWarning: true,
+      waitWarningSeconds: DEFAULT_WAIT_WARNING_SECONDS
+    },
     ledger: [],
     api: {
       mode: 'manual',
-      attackPollSeconds: 5,
+      attackPollSeconds: 8,
       chainPollSeconds: 10,
       paused: false,
       baselineReady: false,
@@ -61,13 +71,33 @@
       chainCurrent: null,
       chainMax: null,
       chainTimeout: null,
+      chainTimeoutObservedAt: 0,
       lastHit: null,
       status: 'Manual mode',
       lastError: '',
       lastAttackPoll: 0,
-      lastChainPoll: 0
+      lastChainPoll: 0,
+      lastSuccessfulSync: 0,
+      consecutiveFailures: 0,
+      backoffUntil: 0,
+      reconciliationNote: ''
     }
   };
+
+  const PDA_HTTP_GET =
+    typeof window.PDA_httpGet === 'function'
+      ? window.PDA_httpGet.bind(window)
+      : typeof globalThis.PDA_httpGet === 'function'
+        ? globalThis.PDA_httpGet.bind(globalThis)
+        : null;
+
+  const PDA_INJECTED_KEY =
+    PDA_API_KEY_LITERAL &&
+    PDA_API_KEY_LITERAL !== '###PDA-APIKEY###'
+      ? PDA_API_KEY_LITERAL.trim()
+      : '';
+
+  const IS_PDA = !!(PDA_HTTP_GET || PDA_INJECTED_KEY);
 
   let state = loadState();
   let history = [];
@@ -76,15 +106,21 @@
   let saveTimer = null;
   let attackInFlight = false;
   let chainInFlight = false;
-  let rosterDragIndex = null;
+  let reconciliationInFlight = false;
   let panelDrag = null;
   let launcherDrag = null;
-  let launcherDragged = false;
+  let rosterDrag = null;
   let suppressLauncherClickUntil = 0;
+  let lastVisibilityChangeAt = Date.now();
+  let lastUpName = '';
+  let upSince = Date.now();
+  let dangerAlertedForHit = null;
+  let criticalAlertedForHit = null;
 
   const clone = value => JSON.parse(JSON.stringify(value));
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const nowUnix = () => Math.floor(Date.now() / 1000);
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   function escapeHtml(value) {
     return String(value)
@@ -106,6 +142,42 @@
     }
   }
 
+  function formatAgo(msTimestamp) {
+    if (!msTimestamp) return '—';
+    const seconds = Math.max(0, Math.floor((Date.now() - msTimestamp) / 1000));
+    if (seconds < 5) return 'now';
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    return `${Math.floor(minutes / 60)}h ago`;
+  }
+
+  function formatCountdown(seconds) {
+    if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+    const value = Math.max(0, Math.floor(Number(seconds)));
+    const mins = Math.floor(value / 60);
+    const secs = value % 60;
+    return `${mins}:${String(secs).padStart(2, '0')}`;
+  }
+
+  function remainingChainSeconds() {
+    if (state.api.chainTimeout == null || !Number.isFinite(Number(state.api.chainTimeout))) {
+      return null;
+    }
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+    return Math.max(0, Number(state.api.chainTimeout) - elapsed);
+  }
+
+  function isTransientError(error) {
+    const status = Number(error?.httpStatus || 0);
+    return error?.transient === true || status === 0 || status === 408 || status === 429 || status >= 500;
+  }
+
+  function platformLabel() {
+    return IS_PDA ? 'Torn PDA' : 'Browser userscript';
+  }
+
   function normalizeParticipant(p) {
     if (typeof p === 'string') return { name: p.trim(), status: 'ready', hits: 0 };
     let status = String(p?.status || 'ready').toLowerCase();
@@ -118,17 +190,20 @@
     };
   }
 
-  function normalizeApi(api) {
+  function normalizeApi(api = {}) {
     return {
       ...clone(DEFAULT_STATE.api),
-      ...(api || {}),
+      ...api,
       mode: ['manual', 'assisted', 'auto'].includes(api?.mode) ? api.mode : 'manual',
-      attackPollSeconds: clamp(Number(api?.attackPollSeconds) || 5, 3, 60),
+      attackPollSeconds: clamp(Number(api?.attackPollSeconds) || 8, 3, 60),
       chainPollSeconds: clamp(Number(api?.chainPollSeconds) || 10, 5, 120),
       processedAttackIds: Array.isArray(api?.processedAttackIds)
         ? api.processedAttackIds.map(String).slice(0, MAX_PROCESSED) : [],
       pendingHits: Array.isArray(api?.pendingHits)
-        ? api.pendingHits.slice(0, MAX_PENDING) : []
+        ? api.pendingHits.slice(0, MAX_PENDING) : [],
+      consecutiveFailures: Math.max(0, Number(api?.consecutiveFailures) || 0),
+      backoffUntil: Math.max(0, Number(api?.backoffUntil) || 0),
+      chainTimeoutObservedAt: Math.max(0, Number(api?.chainTimeoutObservedAt) || 0)
     };
   }
 
@@ -154,6 +229,8 @@
     next.roster = Array.isArray(saved.roster) ? saved.roster.map(normalizeParticipant) : [];
     next.api = normalizeApi(saved.api);
     next.ledger = normalizeLedger(saved.ledger);
+    next.ui = { ...clone(DEFAULT_STATE.ui), ...(saved.ui || {}) };
+    next.ui.waitWarningSeconds = clamp(Number(next.ui.waitWarningSeconds) || DEFAULT_WAIT_WARNING_SECONDS, 60, 900);
     next.minimized = typeof saved.minimized === 'boolean' ? saved.minimized : !!saved.collapsed;
     if (!['roster', 'message', 'api', 'history'].includes(next.settingsTab)) next.settingsTab = 'roster';
     delete next.collapsed;
@@ -164,7 +241,6 @@
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) return migrateState(JSON.parse(raw));
-
       const legacyRaw = localStorage.getItem(LEGACY_KEY);
       if (legacyRaw) {
         const old = JSON.parse(legacyRaw);
@@ -187,20 +263,75 @@
     clearTimeout(saveTimer);
     saveTimer = null;
     state.schemaVersion = SCHEMA_VERSION;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch (error) {
+      console.warn('[Merc-C-Que] State save failed:', error);
+    }
   }
 
-  function saveSoon(delay = 400) {
+  function saveSoon(delay = 350) {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveNow, delay);
   }
 
-  function getApiKey() {
-    try { return String(GM_getValue(API_KEY_STORE, '') || '').trim(); }
-    catch { return ''; }
+  function gmGet(key, fallback = '') {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
+    } catch {}
+    try {
+      return localStorage.getItem(`${API_KEY_FALLBACK_STORE}:${key}`) ?? fallback;
+    } catch {
+      return fallback;
+    }
   }
-  const setApiKey = key => GM_setValue(API_KEY_STORE, String(key || '').trim());
-  const clearApiKey = () => GM_deleteValue(API_KEY_STORE);
+
+  function gmSet(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(key, value);
+        return;
+      }
+    } catch {}
+    try {
+      localStorage.setItem(`${API_KEY_FALLBACK_STORE}:${key}`, String(value));
+    } catch {}
+  }
+
+  function gmDelete(key) {
+    try {
+      if (typeof GM_deleteValue === 'function') {
+        GM_deleteValue(key);
+        return;
+      }
+    } catch {}
+    try {
+      localStorage.removeItem(`${API_KEY_FALLBACK_STORE}:${key}`);
+    } catch {}
+  }
+
+  function getSavedApiKey() {
+    return String(gmGet(API_KEY_STORE, '') || '').trim();
+  }
+
+  function getEffectiveApiKey(overrideKey = '') {
+    const override = String(overrideKey || '').trim();
+    if (override) return override;
+    if (PDA_INJECTED_KEY) return PDA_INJECTED_KEY;
+    return getSavedApiKey();
+  }
+
+  function setApiKey(key) {
+    gmSet(API_KEY_STORE, String(key || '').trim());
+  }
+
+  function clearApiKey() {
+    gmDelete(API_KEY_STORE);
+  }
+
+  function hasApiKey() {
+    return !!getEffectiveApiKey();
+  }
 
   function pushHistory(reason = 'queue change', meta = {}) {
     history.push({
@@ -216,9 +347,6 @@
     state.roster = previous.roster;
     state.manualNextHit = previous.manualNextHit;
     state.ledger = previous.ledger;
-
-    // Keep processed API IDs/live Torn chain intact. The hit really happened;
-    // Undo only reverses the local Merc-C-Que queue effect.
     if (previous.meta?.attackId) {
       const existing = state.ledger.find(x => String(x.id) === String(previous.meta.attackId));
       if (existing) {
@@ -249,8 +377,7 @@
     return state.roster.findIndex(p => p.name.toLowerCase() === needle);
   }
 
-  const automationActive = () =>
-    state.api.mode !== 'manual' && !!getApiKey() && !state.api.paused;
+  const automationActive = () => state.api.mode !== 'manual' && hasApiKey() && !state.api.paused;
 
   function nextHitNumber() {
     if (state.api.mode !== 'manual' && Number.isFinite(Number(state.api.chainCurrent))) {
@@ -264,6 +391,20 @@
     return { hit, nextHit: hit + 1, onDeckHit: hit + 2 };
   }
 
+  function trackUpTimer() {
+    const current = readyParticipants()[0]?.name || '';
+    if (current !== lastUpName) {
+      lastUpName = current;
+      upSince = Date.now();
+    }
+  }
+
+  function upWaitingSeconds() {
+    trackUpTimer();
+    if (!lastUpName) return 0;
+    return Math.max(0, Math.floor((Date.now() - upSince) / 1000));
+  }
+
   function rotateParticipant(name, { recordHit = false, saveHistory = true, reason = 'queue rotation', meta = {} } = {}) {
     const index = findParticipantIndex(name);
     if (index < 0) return false;
@@ -271,6 +412,7 @@
     const [participant] = state.roster.splice(index, 1);
     if (recordHit) participant.hits += 1;
     state.roster.push(participant);
+    trackUpTimer();
     return true;
   }
 
@@ -278,7 +420,6 @@
     if (state.api.mode !== 'manual') return toast('Switch API Mode to Manual before using DONE.');
     const index = currentIndex();
     if (index < 0) return toast('No READY participant.');
-
     const participant = state.roster[index];
     pushHistory('manual DONE');
     state.roster.splice(index, 1);
@@ -290,6 +431,7 @@
       chain: state.manualNextHit - 1, kind: 'manual',
       expected: true, mode: 'manual', action: 'manual-recorded'
     });
+    trackUpTimer();
     saveNow();
     refresh({ roster: true, settings: true });
   }
@@ -300,6 +442,7 @@
     pushHistory('SKIP');
     const [participant] = state.roster.splice(index, 1);
     state.roster.push(participant);
+    trackUpTimer();
     saveNow();
     refresh({ roster: true });
   }
@@ -308,6 +451,7 @@
     if (!state.roster[index]) return;
     pushHistory('READY / AFK change');
     state.roster[index].status = state.roster[index].status === 'ready' ? 'afk' : 'ready';
+    trackUpTimer();
     saveNow();
     refresh({ roster: true });
   }
@@ -316,6 +460,7 @@
     if (!state.roster[index]) return;
     pushHistory('remove participant');
     state.roster.splice(index, 1);
+    trackUpTimer();
     saveNow();
     refresh({ roster: true });
   }
@@ -325,6 +470,7 @@
     pushHistory('reorder roster');
     const [participant] = state.roster.splice(from, 1);
     state.roster.splice(to, 0, participant);
+    trackUpTimer();
     saveNow();
     refresh({ roster: true });
   }
@@ -343,6 +489,7 @@
       return existing ? { ...existing, name } : { name, status: 'ready', hits: 0 };
     });
     rosterDraft = null;
+    trackUpTimer();
     saveNow();
     renderSettings();
     refresh({ roster: true });
@@ -353,6 +500,7 @@
     if (!state.roster.length) return;
     pushHistory('all READY');
     state.roster.forEach(p => p.status = 'ready');
+    trackUpTimer();
     saveNow();
     refresh({ roster: true });
   }
@@ -372,6 +520,7 @@
     state.manualNextHit = 1;
     state.api.pendingHits = [];
     state.ledger = [];
+    trackUpTimer();
     saveNow();
     refresh({ roster: true, settings: true });
   }
@@ -392,39 +541,39 @@
       total_count: String(state.roster.length),
       queue: ready.map(p => p.name).join(', ') || '—',
       last_hitter: state.api.lastHit?.attacker || '—',
-      last_hit: state.api.lastHit?.chain != null ? String(state.api.lastHit.chain) : '—'
+      last_hit: state.api.lastHit?.chain != null ? String(state.api.lastHit.chain) : '—',
+      chain_time: formatCountdown(remainingChainSeconds())
     };
   }
 
   function buildMessage() {
     const data = messageData();
     return String(state.template || '').replace(
-      /\{(current|next|ondeck|hit|next_hit|ondeck_hit|player_hits|current_hits|ready_count|total_count|queue|last_hitter|last_hit)\}/gi,
+      /\{(current|next|ondeck|hit|next_hit|ondeck_hit|player_hits|current_hits|ready_count|total_count|queue|last_hitter|last_hit|chain_time)\}/gi,
       (_, key) => data[key.toLowerCase()] ?? ''
     );
   }
 
-  async function copyText(text, success = 'Copied.') {
+  async function copyText(text, successMessage = 'Copied.') {
     if (!String(text).trim()) return toast('Nothing to copy.');
     try {
       await navigator.clipboard.writeText(text);
     } catch {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      Object.assign(ta.style, { position: 'fixed', opacity: '0' });
-      document.body.appendChild(ta);
-      ta.select();
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
       document.execCommand('copy');
-      ta.remove();
+      textarea.remove();
     }
-    toast(success);
+    toast(successMessage);
   }
-
-  const copyMessage = () => copyText(buildMessage(), 'Merc-C-Que message copied.');
 
   function addLedger(entry) {
     const id = String(entry?.id || `event-${Date.now()}`);
-    const item = {
+    const normalized = {
       id,
       attacker: String(entry?.attacker || 'Unknown'),
       chain: Number(entry?.chain) || 0,
@@ -436,12 +585,12 @@
       result: String(entry?.result || ''),
       undone: !!entry?.undone
     };
-    state.ledger = [item, ...state.ledger.filter(x => String(x.id) !== id)].slice(0, MAX_LEDGER);
-    return item;
+    state.ledger = [normalized, ...state.ledger.filter(item => String(item.id) !== id)].slice(0, MAX_LEDGER);
+    return normalized;
   }
 
-  function updateLedger(id, action, extra = {}) {
-    const item = state.ledger.find(x => String(x.id) === String(id));
+  function updateLedgerAction(id, action, extra = {}) {
+    const item = state.ledger.find(entry => String(entry.id) === String(id));
     if (!item) return;
     item.action = action;
     Object.assign(item, extra);
@@ -460,94 +609,183 @@
       mercCQueVersion: VERSION,
       schemaVersion: state.schemaVersion,
       generatedAt: new Date().toISOString(),
+      platform: platformLabel(),
       mode: state.api.mode,
       paused: state.api.paused,
       chain: {
         id: state.api.chainId,
         current: state.api.chainCurrent,
         max: state.api.chainMax,
-        timeout: state.api.chainTimeout
+        timeout: remainingChainSeconds()
+      },
+      sync: {
+        lastSuccessfulSync: state.api.lastSuccessfulSync,
+        consecutiveFailures: state.api.consecutiveFailures,
+        backoffUntil: state.api.backoffUntil,
+        reconciliationNote: state.api.reconciliationNote
       },
       queue: state.roster,
       pendingHits: state.api.pendingHits,
       lastHit: state.api.lastHit,
-      recentLedger: state.ledger.slice(0, 30)
+      recentLedger: state.ledger.slice(0, 40)
     }, null, 2);
   }
 
-  function apiRequest(path, params = {}, overrideKey = '') {
-    const key = String(overrideKey || getApiKey()).trim();
-    if (!key) return Promise.reject(new Error('No API key saved.'));
+  function parseApiResponse(response) {
+    const status = Number(response?.status ?? 200);
+    const responseText = typeof response?.responseText === 'string'
+      ? response.responseText
+      : typeof response === 'string' ? response : '';
+    let data;
+    try {
+      data = responseText ? JSON.parse(responseText) : response?.responseJSON || {};
+    } catch {
+      const error = new Error(`API returned invalid JSON (HTTP ${status || 'unknown'}).`);
+      error.httpStatus = status;
+      error.transient = status >= 500 || status === 0;
+      throw error;
+    }
+    if (data?.error) {
+      const code = Number(data.error.code ?? 0);
+      const message = data.error.error || data.error.message || 'Unknown API error';
+      const error = new Error(`API ${code}: ${message}`);
+      error.apiCode = code;
+      error.httpStatus = status;
+      error.transient = [5, 8, 9, 10, 14, 17].includes(code);
+      throw error;
+    }
+    if (status && (status < 200 || status >= 300)) {
+      const error = new Error(`HTTP ${status}`);
+      error.httpStatus = status;
+      error.transient = status === 408 || status === 429 || status >= 500;
+      throw error;
+    }
+    return data;
+  }
 
+  async function requestOnce(path, params = {}, overrideKey = '') {
+    const key = getEffectiveApiKey(overrideKey);
+    if (!key) {
+      throw new Error(IS_PDA ? 'Torn PDA API key was not injected.' : 'No API key saved.');
+    }
     const query = new URLSearchParams({
       ...params,
       timestamp: String(nowUnix()),
       comment: 'HKs Merc-C-Que'
     });
-
+    const url = `${API_BASE}${path}?${query.toString()}`;
+    const headers = {
+      Authorization: `ApiKey ${key}`,
+      Accept: 'application/json'
+    };
+    if (PDA_HTTP_GET) {
+      try {
+        const response = await PDA_HTTP_GET(url, headers);
+        return parseApiResponse(response);
+      } catch (error) {
+        if (error?.apiCode || error?.httpStatus) throw error;
+        const wrapped = new Error(error?.message || 'Torn PDA network request failed.');
+        wrapped.transient = true;
+        throw wrapped;
+      }
+    }
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      throw new Error('No supported HTTP transport is available.');
+    }
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
-        method: 'GET',
-        url: `${API_BASE}${path}?${query}`,
-        headers: { Authorization: `ApiKey ${key}`, Accept: 'application/json' },
-        timeout: 12000,
+        method: 'GET', url, headers, timeout: 12000,
         onload: response => {
-          let data;
-          try { data = JSON.parse(response.responseText || '{}'); }
-          catch {
-            reject(new Error(`API returned invalid JSON (HTTP ${response.status}).`));
-            return;
-          }
-          if (data?.error) {
-            const code = Number(data.error.code ?? 0);
-            const message = data.error.error || data.error.message || 'Unknown API error';
-            const error = new Error(`API ${code}: ${message}`);
-            error.apiCode = code;
-            reject(error);
-            return;
-          }
-          if (response.status < 200 || response.status >= 300) {
-            reject(new Error(`HTTP ${response.status}`));
-            return;
-          }
-          resolve(data);
+          try { resolve(parseApiResponse(response)); }
+          catch (error) { reject(error); }
         },
-        onerror: () => reject(new Error('Network error contacting api.torn.com.')),
-        ontimeout: () => reject(new Error('Torn API request timed out.'))
+        onerror: () => {
+          const error = new Error('Network error contacting api.torn.com.');
+          error.transient = true;
+          reject(error);
+        },
+        ontimeout: () => {
+          const error = new Error('Torn API request timed out.');
+          error.httpStatus = 408;
+          error.transient = true;
+          reject(error);
+        }
       });
     });
   }
 
-  const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);
-  const fetchAttacks = (key = '') => apiRequest(
-    '/faction/attacks',
-    { filters: 'outgoing', limit: '50', sort: 'DESC' },
-    key
-  );
-
-  const validChainAttack = attack =>
-    !!(attack && attack.attacker?.name && Number(attack.chain) > 0 && !attack.is_interrupted);
-
-  const attackId = attack => String(
-    attack?.id ?? attack?.code ??
-    `${attack?.ended}-${attack?.attacker?.id}-${attack?.chain}`
-  );
-
-  function markProcessed(id) {
-    const sid = String(id);
-    state.api.processedAttackIds =
-      [sid, ...state.api.processedAttackIds.filter(x => x !== sid)].slice(0, MAX_PROCESSED);
+  async function apiRequest(path, params = {}, overrideKey = '', { retries = 2 } = {}) {
+    let lastError;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        return await requestOnce(path, params, overrideKey);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= retries || !isTransientError(error)) throw error;
+        await sleep(700 * (2 ** attempt));
+      }
+    }
+    throw lastError;
   }
 
-  function addPending(event) {
-    if (state.api.pendingHits.some(x => String(x.id) === String(event.id))) return;
+  const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);
+  const fetchAttacks = (key = '') => apiRequest('/faction/attacks', {
+    filters: 'outgoing', limit: '100', sort: 'DESC'
+  }, key);
+
+  function validChainAttack(attack) {
+    return !!(attack && attack.attacker?.name && Number(attack.chain) > 0 && !attack.is_interrupted);
+  }
+
+  function attackId(attack) {
+    return String(attack?.id ?? attack?.code ?? `${attack?.ended}-${attack?.attacker?.id}-${attack?.chain}`);
+  }
+
+  function markProcessed(id) {
+    const value = String(id);
+    state.api.processedAttackIds = [value, ...state.api.processedAttackIds.filter(x => x !== value)].slice(0, MAX_PROCESSED);
+  }
+
+  function addPendingHit(event) {
+    if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return;
     state.api.pendingHits.push(event);
     state.api.pendingHits = state.api.pendingHits.slice(0, MAX_PENDING);
   }
 
-  function processAttack(attack) {
-    if (!validChainAttack(attack)) return false;
+  function recordSuccessfulSync() {
+    state.api.lastSuccessfulSync = Date.now();
+    state.api.consecutiveFailures = 0;
+    state.api.backoffUntil = 0;
+    state.api.lastError = '';
+  }
 
+  function applyBackoff(error) {
+    state.api.consecutiveFailures += 1;
+    const failures = state.api.consecutiveFailures;
+    const delay = Math.min(60000, 2000 * (2 ** Math.min(5, failures - 1)));
+    state.api.backoffUntil = Date.now() + delay;
+    state.api.lastError = error?.message || String(error);
+    state.api.status = `Temporary API issue — retrying in ${Math.ceil(delay / 1000)}s`;
+  }
+
+  function handleApiError(error) {
+    const message = error?.message || String(error);
+    if ([1, 2, 7].includes(Number(error?.apiCode))) {
+      state.api.paused = true;
+      state.api.lastError = message;
+      state.api.status = `${message} — automation paused`;
+    } else if (isTransientError(error)) {
+      applyBackoff(error);
+    } else {
+      state.api.lastError = message;
+      state.api.status = message;
+    }
+    saveNow();
+    refresh({ settings: true });
+  }
+
+  function processDetectedAttack(attack) {
+    if (!validChainAttack(attack)) return false;
     const id = attackId(attack);
     const attacker = String(attack.attacker.name);
     const chain = Number(attack.chain);
@@ -555,80 +793,74 @@
     const index = findParticipantIndex(attacker);
     const expected = !!current && current.toLowerCase() === attacker.toLowerCase();
     const kind = index < 0 ? 'unknown' : expected ? 'expected' : 'outoforder';
-
-    state.api.chainCurrent = chain;
-    state.manualNextHit = chain + 1;
+    state.api.chainCurrent = Math.max(Number(state.api.chainCurrent) || 0, chain);
+    state.manualNextHit = state.api.chainCurrent + 1;
     state.api.lastHit = {
       attacker, chain, ended: Number(attack.ended) || 0, result: attack.result || ''
     };
-
     const event = {
       id, attacker, chain, ended: Number(attack.ended) || 0,
       result: attack.result || '', kind, expectedPlayer: current || '—'
     };
-
     addLedger({
       id, attacker, chain, kind, expected, mode: state.api.mode,
-      action: 'detected', timestamp: Number(attack.ended) || nowUnix(),
-      result: attack.result || ''
+      action: 'detected', timestamp: Number(attack.ended) || nowUnix(), result: attack.result || ''
     });
-
+    dangerAlertedForHit = null;
+    criticalAlertedForHit = null;
     if (state.api.mode === 'auto' && index >= 0 && expected) {
       pushHistory(`AUTO hit #${chain} by ${attacker}`, {
         attackId: id, attacker, chain, kind, expected, mode: state.api.mode
       });
       rotateParticipant(attacker, { recordHit: true, saveHistory: false });
-      updateLedger(id, 'auto-recorded');
+      updateLedgerAction(id, 'auto-recorded');
       state.api.status = `AUTO: ${attacker} recorded at #${chain}`;
       return true;
     }
-
-    addPending(event);
-    updateLedger(id, 'pending');
-
-    state.api.status = index < 0
-      ? `Hit #${chain}: ${attacker} is not in the queue`
-      : expected
-        ? `Hit #${chain} detected — awaiting confirmation`
-        : `Out-of-order hit #${chain}: ${attacker}`;
-
+    addPendingHit(event);
+    updateLedgerAction(id, 'pending');
+    if (index < 0) state.api.status = `Hit #${chain}: ${attacker} is not in the queue`;
+    else if (expected) state.api.status = `Hit #${chain} detected — awaiting confirmation`;
+    else state.api.status = `Out-of-order hit #${chain}: ${attacker}`;
     return true;
   }
 
-  async function pollAttacks(forceBaseline = false) {
-    if (attackInFlight || !getApiKey()) return;
+  async function pollAttacks({ forceBaseline = false, reconciliation = false } = {}) {
+    if (attackInFlight || !hasApiKey()) return;
+    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
     attackInFlight = true;
     state.api.lastAttackPoll = Date.now();
-
     try {
       const data = await fetchAttacks();
       const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
-
       if (forceBaseline || !state.api.baselineReady) {
-        attacks.forEach(a => markProcessed(attackId(a)));
+        attacks.forEach(attack => markProcessed(attackId(attack)));
         state.api.baselineReady = true;
         state.api.status = 'Connected — watching new faction hits';
-        state.api.lastError = '';
+        if (reconciliation) state.api.reconciliationNote = 'Reconnected and established a fresh attack baseline.';
+        recordSuccessfulSync();
         saveNow();
         refresh();
         return;
       }
-
       const processed = new Set(state.api.processedAttackIds.map(String));
       const fresh = attacks
-        .filter(a => !processed.has(attackId(a)))
-        .sort((a, b) => (Number(a.ended) - Number(b.ended)) || attackId(a).localeCompare(attackId(b)));
-
+        .filter(attack => !processed.has(attackId(attack)))
+        .sort((a, b) => (Number(a.ended) - Number(b.ended)) || (Number(a.chain) - Number(b.chain)) || attackId(a).localeCompare(attackId(b)));
       let changed = false;
       for (const attack of fresh) {
         markProcessed(attackId(attack));
-        if (processAttack(attack)) changed = true;
+        if (processDetectedAttack(attack)) changed = true;
       }
-
       if (!fresh.length) state.api.status = 'Connected — watching new faction hits';
-      state.api.lastError = '';
+      if (reconciliation) {
+        state.api.reconciliationNote = fresh.length
+          ? `Reconciled ${fresh.length} new attack${fresh.length === 1 ? '' : 's'} after resume.`
+          : 'Resume reconciliation complete — no missed attacks found.';
+      }
+      recordSuccessfulSync();
       saveNow();
-      refresh({ roster: changed, settings: changed });
+      refresh({ roster: changed, pending: changed, settings: changed });
     } catch (error) {
       handleApiError(error);
     } finally {
@@ -636,54 +868,52 @@
     }
   }
 
-  async function pollChain() {
-    if (chainInFlight || !getApiKey()) return;
+  async function pollChain({ reconciliation = false } = {}) {
+    if (chainInFlight || !hasApiKey()) return;
+    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
-
     try {
       const data = await fetchChain();
       const chain = data?.chain || null;
-
       if (chain) {
         const previousId = state.api.chainId;
         const previousCurrent = Number(state.api.chainCurrent);
         const newCurrent = Number(chain.current) || 0;
         const newId = chain.id ?? null;
-
-        if (
-          previousId != null && newId != null &&
-          String(previousId) !== String(newId)
-        ) {
-          state.api.baselineReady = false;
-          state.api.processedAttackIds = [];
+        const newChain = previousId != null && newId != null && String(previousId) !== String(newId);
+        if (newChain) {
           state.api.pendingHits = [];
-          state.api.status = 'New chain detected — re-baselining attack watch';
+          state.api.status = 'New chain detected — reconciling attack feed';
+          state.api.reconciliationNote = 'New chain detected; retained processed attack IDs for safe reconciliation.';
+          dangerAlertedForHit = null;
+          criticalAlertedForHit = null;
         }
-
-        const sameChain =
-          previousId != null && newId != null &&
-          String(previousId) === String(newId);
-
-        const acceptedCurrent =
-          sameChain && Number.isFinite(previousCurrent) && newCurrent < previousCurrent
-            ? previousCurrent : newCurrent;
-
+        const sameChain = previousId != null && newId != null && String(previousId) === String(newId);
+        const acceptedCurrent = sameChain && Number.isFinite(previousCurrent) && newCurrent < previousCurrent
+          ? previousCurrent : newCurrent;
         state.api.chainId = newId;
         state.api.chainCurrent = acceptedCurrent;
         state.api.chainMax = Number(chain.max) || 0;
-        state.api.chainTimeout = Number(chain.timeout) || 0;
+        state.api.chainTimeout = Number(chain.timeout);
+        state.api.chainTimeoutObservedAt = Date.now();
         state.manualNextHit = acceptedCurrent + 1;
+        if (newChain && state.api.baselineReady) {
+          setTimeout(() => pollAttacks({ forceBaseline: false, reconciliation: true }), 50);
+        }
       } else {
         state.api.chainId = null;
         state.api.chainCurrent = null;
         state.api.chainMax = null;
         state.api.chainTimeout = null;
+        state.api.chainTimeoutObservedAt = 0;
       }
-
-      state.api.lastError = '';
+      if (reconciliation) {
+        state.api.reconciliationNote = state.api.reconciliationNote || 'Chain state refreshed after resume.';
+      }
+      recordSuccessfulSync();
       saveNow();
-      refresh({ roster: true });
+      refresh();
     } catch (error) {
       handleApiError(error);
     } finally {
@@ -691,33 +921,38 @@
     }
   }
 
-  function handleApiError(error) {
-    const message = error?.message || String(error);
-    state.api.lastError = message;
-    state.api.status = message;
-    if ([1, 2, 7].includes(Number(error?.apiCode))) {
-      state.api.paused = true;
-      state.api.status = `${message} — automation paused`;
+  async function reconcileAfterResume(reason = 'resume') {
+    if (reconciliationInFlight || !automationActive()) return;
+    reconciliationInFlight = true;
+    state.api.status = `Rechecking Torn after ${reason}…`;
+    refresh();
+    try {
+      await pollChain({ reconciliation: true });
+      await pollAttacks({ forceBaseline: false, reconciliation: true });
+      state.api.reconciliationNote = state.api.reconciliationNote || 'Resume reconciliation complete.';
+      saveNow();
+      refresh({ settings: true });
+    } finally {
+      reconciliationInFlight = false;
     }
-    saveNow();
-    refresh({ settings: true });
   }
 
-  async function testApi() {
-    const key = String(apiKeyDraft || getApiKey()).trim();
-    if (!key) return toast('Enter or save an API key first.');
-
-    setApiStatusText('Testing API…');
+  async function testApiConnection() {
+    const key = String(apiKeyDraft || getEffectiveApiKey()).trim();
+    if (!key) return toast(IS_PDA ? 'Torn PDA did not inject an API key.' : 'Enter or save an API key first.');
+    setApiUiText('Testing API…');
     try {
       const [chainData, attackData] = await Promise.all([fetchChain(key), fetchAttacks(key)]);
-      const current = chainData?.chain ? Number(chainData.chain.current) || 0 : 0;
+      const chain = chainData?.chain;
       const attacks = Array.isArray(attackData?.attacks) ? attackData.attacks : [];
+      const current = chain ? Number(chain.current) || 0 : 0;
       state.api.paused = false;
       state.api.lastError = '';
       state.api.status = `API OK — chain ${current}; attack feed accessible (${attacks.length} returned)`;
+      recordSuccessfulSync();
       saveNow();
       refresh({ settings: true });
-      toast('API connection successful.');
+      toast(`API connection successful (${platformLabel()}).`);
     } catch (error) {
       handleApiError(error);
       toast(error?.message || 'API test failed.');
@@ -725,11 +960,9 @@
   }
 
   function saveApiSettings() {
-    const newKey = String(
-      document.querySelector('#hkmcq-api-key')?.value || apiKeyDraft || ''
-    ).trim();
-
-    if (newKey) {
+    const keyField = document.querySelector('#hkmcq-api-key');
+    const newKey = String(keyField?.value || apiKeyDraft || '').trim();
+    if (newKey && !PDA_INJECTED_KEY) {
       setApiKey(newKey);
       apiKeyDraft = '';
       state.api.baselineReady = false;
@@ -737,16 +970,21 @@
       state.api.pendingHits = [];
       state.api.paused = false;
     }
-
+    const modeElement = document.querySelector('#hkmcq-api-mode');
+    const attackElement = document.querySelector('#hkmcq-attack-poll');
+    const chainElement = document.querySelector('#hkmcq-chain-poll');
+    const soundElement = document.querySelector('#hkmcq-sound-alerts');
+    const waitElement = document.querySelector('#hkmcq-wait-warning');
+    const waitSecondsElement = document.querySelector('#hkmcq-wait-seconds');
     const oldMode = state.api.mode;
-    const mode = document.querySelector('#hkmcq-api-mode');
-    const attackPoll = document.querySelector('#hkmcq-attack-poll');
-    const chainPoll = document.querySelector('#hkmcq-chain-poll');
-
-    if (mode) state.api.mode = mode.value;
-    if (attackPoll) state.api.attackPollSeconds = clamp(Number(attackPoll.value) || 5, 3, 60);
-    if (chainPoll) state.api.chainPollSeconds = clamp(Number(chainPoll.value) || 10, 5, 120);
-
+    if (modeElement) state.api.mode = modeElement.value;
+    if (attackElement) state.api.attackPollSeconds = clamp(Number(attackElement.value) || 8, 3, 60);
+    if (chainElement) state.api.chainPollSeconds = clamp(Number(chainElement.value) || 10, 5, 120);
+    if (soundElement) state.ui.soundAlerts = !!soundElement.checked;
+    if (waitElement) state.ui.waitWarning = !!waitElement.checked;
+    if (waitSecondsElement) {
+      state.ui.waitWarningSeconds = clamp(Number(waitSecondsElement.value) || DEFAULT_WAIT_WARNING_SECONDS, 60, 900);
+    }
     if (oldMode === 'manual' && state.api.mode !== 'manual') {
       state.api.baselineReady = false;
       state.api.processedAttackIds = [];
@@ -754,83 +992,143 @@
       state.api.paused = false;
       state.api.status = 'Starting API watch…';
     }
-
     if (state.api.mode === 'manual') {
-      state.api.status = getApiKey() ? 'Manual mode — API watch stopped' : 'Manual mode';
-    } else if (!getApiKey()) {
+      state.api.status = hasApiKey() ? 'Manual mode — API watch stopped' : 'Manual mode';
+    } else if (!hasApiKey()) {
       state.api.status = 'API key required';
     }
-
     state.api.lastAttackPoll = 0;
     state.api.lastChainPoll = 0;
+    state.api.consecutiveFailures = 0;
+    state.api.backoffUntil = 0;
     saveNow();
     renderSettings();
-    refresh({ roster: true });
+    refresh();
     toast('API settings saved.');
-
     if (automationActive()) {
       pollChain();
-      pollAttacks(true);
+      pollAttacks({ forceBaseline: !state.api.baselineReady });
     }
   }
 
-  function removeApiKey() {
+  function removeSavedApiKey() {
+    if (PDA_INJECTED_KEY) {
+      toast('Torn PDA supplies the API key automatically; remove or change it in Torn PDA.');
+      return;
+    }
     if (!confirm('Remove the saved Torn API key from Merc-C-Que?')) return;
     clearApiKey();
     apiKeyDraft = '';
-    Object.assign(state.api, {
-      mode: 'manual', paused: false, baselineReady: false,
-      processedAttackIds: [], pendingHits: [],
-      status: 'Manual mode', lastError: ''
-    });
+    state.api.mode = 'manual';
+    state.api.paused = false;
+    state.api.baselineReady = false;
+    state.api.processedAttackIds = [];
+    state.api.pendingHits = [];
+    state.api.status = 'Manual mode';
+    state.api.lastError = '';
     saveNow();
     renderSettings();
-    refresh({ roster: true });
+    refresh();
     toast('API key removed.');
   }
 
-  function confirmPending(addUnknown = false) {
+  function confirmPendingHit(addUnknown = false) {
     const event = state.api.pendingHits[0];
     if (!event) return;
     if (event.kind === 'unknown' && !addUnknown) return;
-
     pushHistory(`confirm hit #${event.chain} by ${event.attacker}`, {
       attackId: event.id, attacker: event.attacker, chain: event.chain,
       kind: event.kind, expected: event.kind === 'expected', mode: state.api.mode
     });
-
     if (event.kind === 'unknown') {
       state.roster.push({ name: event.attacker, status: 'ready', hits: 1 });
-      updateLedger(event.id, 'added-and-recorded');
+      updateLedgerAction(event.id, 'added-and-recorded');
     } else {
       rotateParticipant(event.attacker, { recordHit: true, saveHistory: false });
-      updateLedger(event.id, 'recorded');
+      updateLedgerAction(event.id, 'recorded');
     }
-
     state.api.pendingHits.shift();
     state.api.status = `Recorded ${event.attacker} at hit #${event.chain}`;
+    trackUpTimer();
     saveNow();
-    refresh({ roster: true, settings: true });
+    refresh({ roster: true, pending: true, settings: true });
   }
 
-  function ignorePending() {
+  function ignorePendingHit() {
     const event = state.api.pendingHits.shift();
     if (!event) return;
-    updateLedger(event.id, 'ignored');
+    updateLedgerAction(event.id, 'ignored');
     state.api.status = `Ignored detected hit #${event.chain} by ${event.attacker}`;
     saveNow();
-    refresh({ settings: true });
+    refresh({ pending: true, settings: true });
+  }
+
+  function desiredAttackPollSeconds() {
+    const base = state.api.attackPollSeconds;
+    const remaining = remainingChainSeconds();
+    if (remaining != null && remaining <= DANGER_SECONDS) return 3;
+    if (document.hidden) return Math.max(base, 15);
+    if (state.api.chainCurrent == null) return Math.max(base, 20);
+    return base;
+  }
+
+  function desiredChainPollSeconds() {
+    const base = state.api.chainPollSeconds;
+    const remaining = remainingChainSeconds();
+    if (remaining != null && remaining <= DANGER_SECONDS) return 3;
+    if (document.hidden) return Math.max(base, 15);
+    if (state.api.chainCurrent == null) return Math.max(base, 20);
+    return base;
+  }
+
+  function beepOnce(frequency = 740) {
+    if (!state.ui.soundAlerts) return;
+    try {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      const context = new AudioContext();
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.0001, context.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.start();
+      oscillator.stop(context.currentTime + 0.2);
+      oscillator.addEventListener('ended', () => context.close());
+    } catch {}
+  }
+
+  function runDangerAlerts() {
+    if (state.api.mode === 'manual' || state.api.chainCurrent == null) return;
+    const remaining = remainingChainSeconds();
+    if (remaining == null) return;
+    const hit = nextHitNumber();
+    if (remaining <= CRITICAL_SECONDS && criticalAlertedForHit !== hit) {
+      criticalAlertedForHit = hit;
+      toast(`CHAIN CRITICAL — ${formatCountdown(remaining)} remaining.`);
+      beepOnce(920);
+      return;
+    }
+    if (remaining <= DANGER_SECONDS && dangerAlertedForHit !== hit) {
+      dangerAlertedForHit = hit;
+      toast(`Chain warning — ${formatCountdown(remaining)} remaining.`);
+      beepOnce(720);
+    }
   }
 
   function schedulerTick() {
+    trackUpTimer();
+    runDangerAlerts();
+    if (state.minimized) refreshLauncher();
+    else refreshLiveIndicators();
     if (!automationActive()) return;
+    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
     const now = Date.now();
-    if (now - Number(state.api.lastAttackPoll || 0) >= state.api.attackPollSeconds * 1000) {
-      pollAttacks(false);
-    }
-    if (now - Number(state.api.lastChainPoll || 0) >= state.api.chainPollSeconds * 1000) {
-      pollChain();
-    }
+    if (now - Number(state.api.lastAttackPoll || 0) >= desiredAttackPollSeconds() * 1000) pollAttacks();
+    if (now - Number(state.api.lastChainPoll || 0) >= desiredChainPollSeconds() * 1000) pollChain();
   }
 
   function detectDarkTheme() {
@@ -844,103 +1142,68 @@
 
   function installStyle() {
     if (document.getElementById(STYLE_ID)) return;
-
     const dark = detectDarkTheme();
-    const c = dark ? {
-      p: 'rgba(28,28,28,.98)', p2: '#252525', t: '#f1f1f1', m: '#aaa',
-      b: '#505050', i: '#202020', btn: '#333', hov: '#444', s: '#fff',
-      warn: '#3a2e17', active: '#4a4a4a'
-    } : {
-      p: 'rgba(248,248,248,.99)', p2: '#ededed', t: '#222', m: '#666',
-      b: '#c5c5c5', i: '#fff', btn: '#e4e4e4', hov: '#d8d8d8', s: '#111',
-      warn: '#fff4cf', active: '#d2d2d2'
-    };
-
+    const colors = dark
+      ? { panel:'rgba(28,28,28,.98)', panel2:'#252525', text:'#f1f1f1', muted:'#aaa', border:'#505050', input:'#202020', button:'#333', hover:'#444', strong:'#fff', warn:'#3a2e17', danger:'#4a2020', active:'#4a4a4a' }
+      : { panel:'rgba(248,248,248,.99)', panel2:'#ededed', text:'#222', muted:'#666', border:'#c5c5c5', input:'#fff', button:'#e4e4e4', hover:'#d8d8d8', strong:'#111', warn:'#fff4cf', danger:'#ffe0e0', active:'#d2d2d2' };
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-#${PANEL_ID}{--p:${c.p};--p2:${c.p2};--t:${c.t};--m:${c.m};--b:${c.b};--i:${c.i};--btn:${c.btn};--hov:${c.hov};--s:${c.s};--warn:${c.warn};--active:${c.active};position:fixed;top:105px;right:16px;width:365px;z-index:999999;background:var(--p);color:var(--t);border:1px solid var(--b);border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.32);font:13px Arial,Helvetica,sans-serif;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;user-select:none}
-#${PANEL_ID} *{box-sizing:border-box}
-#${PANEL_ID} .head{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:7px;padding:9px 10px;background:var(--p2);border-bottom:1px solid var(--b);cursor:move}
-#${PANEL_ID} .title{flex:1;font-weight:800;color:var(--s);letter-spacing:.2px}
-#${PANEL_ID} .sub{font-size:10px;font-weight:400;color:var(--m);margin-top:1px}
-#${PANEL_ID} button,#${PANEL_ID} input,#${PANEL_ID} textarea,#${PANEL_ID} select{font:inherit}
-#${PANEL_ID} button{border:1px solid var(--b);background:var(--btn);color:var(--t);border-radius:6px;padding:5px 8px;cursor:pointer}
-#${PANEL_ID} button:hover{background:var(--hov)}
-#${PANEL_ID} button:disabled{cursor:default;opacity:.45}
-#${PANEL_ID} .icon{width:28px;height:28px;padding:0;display:grid;place-items:center}
-#${PANEL_ID} .main{padding:10px}
-#${PANEL_ID} .up{text-align:center;padding:10px 8px;background:var(--p2);border:1px solid var(--b);border-radius:8px}
-#${PANEL_ID} .kicker{font-size:10px;color:var(--m);letter-spacing:1px}
-#${PANEL_ID} .upLine{display:flex;justify-content:center;align-items:baseline;gap:7px;flex-wrap:wrap;margin-top:4px}
-#${PANEL_ID} .upName{font-size:21px;font-weight:800;color:var(--s)}
-#${PANEL_ID} .hitBadge{font-size:12px;font-weight:700;color:var(--m)}
-#${PANEL_ID} .nextGrid{display:grid;grid-template-columns:70px 1fr;gap:5px 8px;padding:8px 3px 2px}
-#${PANEL_ID} .label{font-size:11px;color:var(--m)}
-#${PANEL_ID} .nextPerson{display:flex;justify-content:space-between;gap:8px}
-#${PANEL_ID} .queueHit{color:var(--m);font-size:10px;white-space:nowrap}
-#${PANEL_ID} .controls{display:grid;grid-template-columns:1.5fr 1fr .8fr;gap:6px;margin-top:8px}
-#${PANEL_ID} .done{font-weight:800;padding:8px 10px}
-#${PANEL_ID} .done.locked{opacity:.5}
-#${PANEL_ID} .hitRow{display:grid;grid-template-columns:auto 1fr auto;gap:7px;align-items:center;margin-top:8px}
-#${PANEL_ID} input,#${PANEL_ID} textarea,#${PANEL_ID} select{width:100%;border:1px solid var(--b);background:var(--i);color:var(--t);border-radius:6px;padding:6px 7px;outline:none}
-#${PANEL_ID} textarea{min-height:58px;resize:vertical;user-select:text;max-width:100%}
-#${PANEL_ID} .preview{margin-top:8px;min-height:44px;white-space:pre-wrap;word-break:break-word;user-select:text}
-#${PANEL_ID} .copy{width:100%;margin-top:5px;font-weight:700}
-#${PANEL_ID} .apiStrip{margin-top:8px;padding:6px 7px;border:1px solid var(--b);border-radius:6px;font-size:10px;color:var(--m);display:flex;gap:7px;justify-content:space-between;align-items:center}
-#${PANEL_ID} .apiStrip strong{color:var(--t)}
-#${PANEL_ID} .pending{margin-top:8px;padding:8px;border:1px solid #9b7a2e;border-radius:7px;background:var(--warn)}
-#${PANEL_ID} .pendingTitle{font-weight:800;margin-bottom:4px}
-#${PANEL_ID} .pendingText{font-size:11px;line-height:1.35}
-#${PANEL_ID} .pendingBtns{display:flex;gap:6px;margin-top:7px}
-#${PANEL_ID} .pendingBtns button{flex:1}
-#${PANEL_ID} .roster{margin-top:9px;max-height:245px;overflow:auto;border-top:1px solid var(--b)}
-#${PANEL_ID} .row{display:grid;grid-template-columns:20px minmax(0,1fr) 46px 54px 25px;gap:5px;align-items:center;padding:6px 0;border-bottom:1px solid var(--b)}
-#${PANEL_ID} .row[draggable=true]{cursor:grab}
-#${PANEL_ID} .row.dragover{outline:1px dashed var(--m)}
-#${PANEL_ID} .handle{text-align:center;color:var(--m)}
-#${PANEL_ID} .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#${PANEL_ID} .assigned{font-size:10px;color:var(--m);margin-left:4px}
-#${PANEL_ID} .phits{text-align:right;font-size:10px;color:var(--m)}
-#${PANEL_ID} .status{font-size:10px;font-weight:700;padding:3px 5px;text-transform:uppercase}
-#${PANEL_ID} .status[data-status=afk]{opacity:.55}
-#${PANEL_ID} .remove{width:25px;height:25px;padding:0}
-#${PANEL_ID} .settingsShell{margin-top:10px;padding-top:10px;border-top:1px solid var(--b)}
-#${PANEL_ID} .settingsTabs{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:8px}
-#${PANEL_ID} .settingsTabs button{padding:5px 3px;font-size:10px}
-#${PANEL_ID} .settingsTabs button.active{background:var(--active);font-weight:800}
-#${PANEL_ID} .sectionTitle{font-weight:800;margin-bottom:5px}
-#${PANEL_ID} .help{font-size:10px;color:var(--m);line-height:1.35;margin-top:4px}
-#${PANEL_ID} .miniRow{display:flex;gap:6px;margin-top:6px}
-#${PANEL_ID} .miniRow>*{flex:1}
-#${PANEL_ID} .settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-#${PANEL_ID} .full{grid-column:1/-1}
-#${PANEL_ID} .apiStatusBox{margin-top:6px;padding:7px;border:1px solid var(--b);border-radius:6px;font-size:10px;line-height:1.4;color:var(--m)}
-#${PANEL_ID} .ledger{max-height:250px;overflow:auto;border:1px solid var(--b);border-radius:6px}
-#${PANEL_ID} .ledgerRow{display:grid;grid-template-columns:58px minmax(0,1fr) auto;gap:6px;padding:6px;border-bottom:1px solid var(--b);font-size:10px}
-#${PANEL_ID} .ledgerRow:last-child{border-bottom:0}
-#${PANEL_ID} .ledgerMeta{color:var(--m)}
-#${LAUNCHER_ID}{position:fixed;z-index:1000000;min-width:78px;height:38px;padding:0 11px;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid ${c.b};border-radius:8px;background:${c.p2};color:${c.t};box-shadow:0 6px 18px rgba(0,0,0,.35);font:800 11px Arial,Helvetica,sans-serif;letter-spacing:.4px;cursor:grab;user-select:none}
-#${LAUNCHER_ID}:hover{background:${c.hov}}
-#${LAUNCHER_ID}.dragging{cursor:grabbing;opacity:.9}
-#${LAUNCHER_ID} .launcherDot{width:8px;height:8px;border-radius:50%;background:#777;flex:0 0 auto}
-#${LAUNCHER_ID}.active .launcherDot{background:#5ca85c}
-#${LAUNCHER_ID}.paused .launcherDot{background:#c9902f}
-#${LAUNCHER_ID}.pending .launcherDot{background:#c45b5b}
-#${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800;box-shadow:0 2px 7px rgba(0,0,0,.35)}
-#${TOAST_ID}{position:fixed;right:20px;bottom:22px;z-index:1000001;background:rgba(20,20,20,.95);color:#fff;border-radius:7px;padding:9px 12px;font:13px Arial,Helvetica,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}
-`;
+      #${PANEL_ID}{--p:${colors.panel};--p2:${colors.panel2};--t:${colors.text};--m:${colors.muted};--b:${colors.border};--i:${colors.input};--btn:${colors.button};--hov:${colors.hover};--s:${colors.strong};--warn:${colors.warn};--danger:${colors.danger};--active:${colors.active};position:fixed;top:105px;right:16px;width:min(365px,calc(100vw - 12px));z-index:999999;background:var(--p);color:var(--t);border:1px solid var(--b);border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.32);font:13px Arial,Helvetica,sans-serif;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;user-select:none;touch-action:pan-y}
+      #${PANEL_ID} *{box-sizing:border-box}
+      #${PANEL_ID} .head{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:7px;padding:9px 10px;background:var(--p2);border-bottom:1px solid var(--b);cursor:grab;touch-action:none}
+      #${PANEL_ID} .title{flex:1;font-weight:800;color:var(--s)}
+      #${PANEL_ID} .sub{font-size:10px;font-weight:400;color:var(--m);margin-top:1px}
+      #${PANEL_ID} button,#${PANEL_ID} input,#${PANEL_ID} textarea,#${PANEL_ID} select{font:inherit}
+      #${PANEL_ID} button{min-height:32px;border:1px solid var(--b);background:var(--btn);color:var(--t);border-radius:6px;padding:5px 8px;cursor:pointer}
+      #${PANEL_ID} button:hover{background:var(--hov)} #${PANEL_ID} button:disabled{cursor:default;opacity:.45}
+      #${PANEL_ID} .icon{width:32px;height:32px;padding:0} #${PANEL_ID} .main{padding:10px}
+      #${PANEL_ID} .up{text-align:center;padding:10px 8px;background:var(--p2);border:1px solid var(--b);border-radius:8px}
+      #${PANEL_ID} .kicker,#${PANEL_ID} .label{font-size:10px;color:var(--m)}
+      #${PANEL_ID} .upLine{display:flex;justify-content:center;align-items:baseline;gap:7px;flex-wrap:wrap;margin-top:4px}
+      #${PANEL_ID} .upName{font-size:21px;font-weight:800;color:var(--s)} #${PANEL_ID} .hitBadge{font-size:12px;font-weight:700;color:var(--m)}
+      #${PANEL_ID} .waitWarn{margin-top:5px;font-size:10px;color:#d39a36;font-weight:700}
+      #${PANEL_ID} .nextGrid{display:grid;grid-template-columns:70px 1fr;gap:5px 8px;padding:8px 3px 2px}
+      #${PANEL_ID} .nextPerson{display:flex;justify-content:space-between;gap:8px} #${PANEL_ID} .queueHit{color:var(--m);font-size:10px;white-space:nowrap}
+      #${PANEL_ID} .controls{display:grid;grid-template-columns:1.5fr 1fr .8fr;gap:6px;margin-top:8px} #${PANEL_ID} .done{font-weight:800} #${PANEL_ID} .done.locked{opacity:.5}
+      #${PANEL_ID} .hitRow{display:grid;grid-template-columns:auto 1fr auto;gap:7px;align-items:center;margin-top:8px}
+      #${PANEL_ID} input,#${PANEL_ID} textarea,#${PANEL_ID} select{width:100%;border:1px solid var(--b);background:var(--i);color:var(--t);border-radius:6px;padding:7px;outline:none}
+      #${PANEL_ID} textarea{min-height:64px;resize:vertical;user-select:text} #${PANEL_ID} .preview{margin-top:8px;min-height:44px;white-space:pre-wrap;word-break:break-word;user-select:text}
+      #${PANEL_ID} .copy{width:100%;margin-top:5px;font-weight:700}
+      #${PANEL_ID} .apiStrip{margin-top:8px;padding:7px;border:1px solid var(--b);border-radius:6px;font-size:10px;color:var(--m);display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center}
+      #${PANEL_ID} .apiStrip strong{color:var(--t)} #${PANEL_ID} .apiStrip.danger{background:var(--warn)} #${PANEL_ID} .apiStrip.critical{background:var(--danger);animation:hkmcqPulse 1s infinite}
+      @keyframes hkmcqPulse{50%{opacity:.72}}
+      #${PANEL_ID} .pending{margin-top:8px;padding:8px;border:1px solid #9b7a2e;border-radius:7px;background:var(--warn)} #${PANEL_ID} .pendingTitle{font-weight:800;margin-bottom:4px} #${PANEL_ID} .pendingText{font-size:11px;line-height:1.35}
+      #${PANEL_ID} .pendingBtns{display:flex;gap:6px;margin-top:7px} #${PANEL_ID} .pendingBtns button{flex:1}
+      #${PANEL_ID} .roster{margin-top:9px;max-height:245px;overflow:auto;border-top:1px solid var(--b)} #${PANEL_ID} .row{display:grid;grid-template-columns:28px minmax(0,1fr) 46px 58px 32px;gap:5px;align-items:center;padding:6px 0;border-bottom:1px solid var(--b)}
+      #${PANEL_ID} .handle{height:32px;display:grid;place-items:center;color:var(--m);touch-action:none;cursor:grab} #${PANEL_ID} .row.dragging{opacity:.55} #${PANEL_ID} .row.dragover{outline:1px dashed var(--m)}
+      #${PANEL_ID} .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} #${PANEL_ID} .name .assigned{font-size:10px;color:var(--m);margin-left:4px} #${PANEL_ID} .phits{text-align:right;font-size:10px;color:var(--m)}
+      #${PANEL_ID} .status{font-size:10px;font-weight:700;padding:3px 5px;text-transform:uppercase} #${PANEL_ID} .status[data-status=afk]{opacity:.55} #${PANEL_ID} .remove{width:32px;height:32px;padding:0}
+      #${PANEL_ID} .settingsShell{margin-top:10px;padding-top:10px;border-top:1px solid var(--b)} #${PANEL_ID} .settingsTabs{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:8px} #${PANEL_ID} .settingsTabs button{padding:5px 3px;font-size:10px} #${PANEL_ID} .settingsTabs button.active{background:var(--active);font-weight:800}
+      #${PANEL_ID} .sectionTitle{font-weight:800;margin-bottom:5px} #${PANEL_ID} .help{font-size:10px;color:var(--m);line-height:1.35;margin-top:4px} #${PANEL_ID} .miniRow{display:flex;gap:6px;margin-top:6px} #${PANEL_ID} .miniRow>*{flex:1}
+      #${PANEL_ID} .settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:6px} #${PANEL_ID} .full{grid-column:1/-1} #${PANEL_ID} .checkRow{display:flex;gap:8px;align-items:center;font-size:11px} #${PANEL_ID} .checkRow input{width:auto}
+      #${PANEL_ID} .apiStatusBox{margin-top:6px;padding:7px;border:1px solid var(--b);border-radius:6px;font-size:10px;line-height:1.45;color:var(--m)} #${PANEL_ID} .ledger{max-height:250px;overflow:auto;border:1px solid var(--b);border-radius:6px} #${PANEL_ID} .ledgerRow{display:grid;grid-template-columns:58px minmax(0,1fr) auto;gap:6px;padding:6px;border-bottom:1px solid var(--b);font-size:10px} #${PANEL_ID} .ledgerMeta{color:var(--m)}
+      #${LAUNCHER_ID}{position:fixed;z-index:1000000;min-width:112px;min-height:42px;padding:0 11px;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid ${colors.border};border-radius:8px;background:${colors.panel2};color:${colors.text};box-shadow:0 6px 18px rgba(0,0,0,.35);font:800 11px Arial,Helvetica,sans-serif;cursor:grab;user-select:none;touch-action:none}
+      #${LAUNCHER_ID}.danger{background:${colors.warn}} #${LAUNCHER_ID}.critical{background:${colors.danger};animation:hkmcqPulse 1s infinite} #${LAUNCHER_ID} .launcherDot{width:8px;height:8px;border-radius:50%;background:#777;flex:0 0 auto} #${LAUNCHER_ID}.active .launcherDot{background:#5ca85c} #${LAUNCHER_ID}.paused .launcherDot{background:#c9902f} #${LAUNCHER_ID}.pending .launcherDot{background:#c45b5b}
+      #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}
+      #${TOAST_ID}{position:fixed;right:20px;bottom:22px;z-index:1000001;background:rgba(20,20,20,.95);color:#fff;border-radius:7px;padding:9px 12px;font:13px Arial,Helvetica,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}
+      @media(max-width:600px){#${PANEL_ID}{width:calc(100vw - 8px);left:4px!important;right:auto!important;top:58px;border-radius:8px;font-size:14px}#${PANEL_ID} button{min-height:40px}#${PANEL_ID} .icon,#${PANEL_ID} .remove,#${PANEL_ID} .handle{width:40px;height:40px}#${PANEL_ID} .row{grid-template-columns:40px minmax(0,1fr) 42px 62px 40px}#${PANEL_ID} .roster{max-height:36vh}#${PANEL_ID} .controls{grid-template-columns:1.45fr 1fr 1fr}#${PANEL_ID} .upName{font-size:23px}#${LAUNCHER_ID}{min-height:46px;min-width:126px}}
+    `;
     document.head.appendChild(style);
   }
 
   function defaultLauncherPosition() {
     return {
-      left: Math.max(8, window.innerWidth - 95),
+      left: Math.max(8, window.innerWidth - 135),
       top: Math.max(70, Math.round(window.innerHeight * 0.45))
     };
   }
 
   function clampPanelPosition(left, top, panel) {
+    const mobile = window.innerWidth <= 600;
+    if (mobile) {
+      return { left: 4, top: clamp(top, 4, Math.max(4, window.innerHeight - 180)) };
+    }
     return {
       left: clamp(left, 0, Math.max(0, window.innerWidth - panel.offsetWidth)),
       top: clamp(top, 0, Math.max(0, window.innerHeight - 180))
@@ -979,132 +1242,153 @@
   }
 
   function rosterRowsHtml() {
-    if (!state.roster.length) {
-      return '<div style="padding:10px 2px;color:var(--m)">No participants yet. Open Setup to paste your roster.</div>';
-    }
+    if (!state.roster.length) return '<div style="padding:10px 2px;color:var(--m);">No participants yet. Open Setup to paste your roster.</div>';
     const base = nextHitNumber();
     let readyOffset = 0;
-    return state.roster.map((p, i) => {
-      const assigned = p.status === 'ready' ? base + readyOffset++ : null;
-      return `<div class="row" draggable="true" data-index="${i}">
-        <div class="handle" title="Drag to reorder">☰</div>
-        <div class="name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}${assigned != null ? `<span class="assigned">#${assigned}</span>` : ''}</div>
-        <div class="phits" title="Completed hits recorded for this player">${p.hits} hit${p.hits === 1 ? '' : 's'}</div>
-        <button class="status" data-action="status" data-index="${i}" data-status="${p.status}" title="Toggle READY / AFK">${p.status}</button>
-        <button class="remove" data-action="remove" data-index="${i}" title="Remove from queue">×</button>
-      </div>`;
+    return state.roster.map((participant, index) => {
+      const assigned = participant.status === 'ready' ? base + readyOffset++ : null;
+      return `
+        <div class="row" data-index="${index}">
+          <div class="handle" data-drag-index="${index}" title="Drag to reorder">☰</div>
+          <div class="name" title="${escapeHtml(participant.name)}">${escapeHtml(participant.name)}${assigned != null ? `<span class="assigned">#${assigned}</span>` : ''}</div>
+          <div class="phits">${participant.hits}</div>
+          <button class="status" data-action="status" data-index="${index}" data-status="${participant.status}">${participant.status}</button>
+          <button class="remove" data-action="remove" data-index="${index}" title="Remove from queue">×</button>
+        </div>`;
     }).join('');
   }
 
+  function waitWarningHtml() {
+    if (!state.ui.waitWarning || !readyParticipants().length) return '';
+    const seconds = upWaitingSeconds();
+    if (seconds < state.ui.waitWarningSeconds) return '';
+    const minutes = Math.floor(seconds / 60);
+    const remain = seconds % 60;
+    return `<div id="hkmcq-wait-warning" class="waitWarn">Waiting ${minutes}:${String(remain).padStart(2, '0')} — consider SKIP if unavailable</div>`;
+  }
+
   function pendingHtml() {
-    const p = state.api.pendingHits[0];
-    if (!p) return '';
+    const pending = state.api.pendingHits[0];
+    if (!pending) return '';
     const count = state.api.pendingHits.length;
-    const title = p.kind === 'expected' ? 'HIT DETECTED'
-      : p.kind === 'unknown' ? 'UNQUEUED HIT DETECTED' : 'OUT-OF-ORDER HIT';
-    let text = `<strong>${escapeHtml(p.attacker)}</strong> completed HIT #${p.chain}.`;
-    if (p.kind === 'outoforder') text += `<br>Expected next: <strong>${escapeHtml(p.expectedPlayer)}</strong>.`;
-    if (p.kind === 'unknown') text += '<br>This player is not currently in Merc-C-Que.';
+    const title = pending.kind === 'expected' ? 'HIT DETECTED' : pending.kind === 'unknown' ? 'UNQUEUED HIT DETECTED' : 'OUT-OF-ORDER HIT';
+    let text = `<strong>${escapeHtml(pending.attacker)}</strong> completed HIT #${pending.chain}.`;
+    if (pending.kind === 'outoforder') text += `<br>Expected next: <strong>${escapeHtml(pending.expectedPlayer)}</strong>.`;
+    if (pending.kind === 'unknown') text += '<br>This player is not currently in Merc-C-Que.';
     if (count > 1) text += `<br>${count - 1} additional detected hit${count - 1 === 1 ? '' : 's'} waiting.`;
-    const confirm = p.kind === 'unknown' ? 'ADD & RECORD' : p.kind === 'expected' ? 'CONFIRM / ADVANCE' : 'RECORD HIT';
-    return `<div class="pending"><div class="pendingTitle">⚠ ${title}</div>
-      <div class="pendingText">${text}</div><div class="pendingBtns">
-      <button data-action="confirmPending" data-add-unknown="${p.kind === 'unknown' ? '1' : '0'}">${confirm}</button>
-      <button data-action="ignorePending">IGNORE</button></div></div>`;
+    const confirmLabel = pending.kind === 'unknown' ? 'ADD & RECORD' : pending.kind === 'expected' ? 'CONFIRM / ADVANCE' : 'RECORD HIT';
+    return `
+      <div class="pending">
+        <div class="pendingTitle">⚠ ${title}</div>
+        <div class="pendingText">${text}</div>
+        <div class="pendingBtns">
+          <button data-action="confirmPending" data-add-unknown="${pending.kind === 'unknown' ? '1' : '0'}">${confirmLabel}</button>
+          <button data-action="ignorePending">IGNORE</button>
+        </div>
+      </div>`;
   }
 
   function apiStripHtml() {
-    if (state.api.mode === 'manual') {
-      return '<div class="apiStrip"><strong>MANUAL</strong><span>API watch stopped</span></div>';
-    }
     const mode = state.api.mode.toUpperCase();
-    const chain = state.api.chainCurrent ?? '—';
-    const last = state.api.lastHit
-      ? `${escapeHtml(state.api.lastHit.attacker)} #${state.api.lastHit.chain}` : '—';
-    return `<div class="apiStrip"><strong>${mode}${state.api.paused ? ' • PAUSED' : ''}</strong>
-      <span>Chain ${chain}</span><span>Last ${last}</span></div>`;
+    if (state.api.mode === 'manual') {
+      return `<div class="apiStrip"><strong>MANUAL</strong><span>API watch stopped</span><span>${platformLabel()}</span></div>`;
+    }
+    const chain = state.api.chainCurrent != null
+      ? (state.api.chainMax ? `${state.api.chainCurrent}/${state.api.chainMax}` : state.api.chainCurrent)
+      : '—';
+    const remaining = remainingChainSeconds();
+    const urgency = remaining != null && remaining <= CRITICAL_SECONDS ? 'critical'
+      : remaining != null && remaining <= DANGER_SECONDS ? 'danger' : '';
+    const paused = state.api.paused ? ' • PAUSED' : '';
+    return `<div class="apiStrip ${urgency}"><strong>${mode}${paused}</strong><span>Chain ${chain}</span><span id="hkmcq-chain-clock">${formatCountdown(remaining)}</span></div>`;
   }
 
-  function tabsHtml() {
-    return ['roster', 'message', 'api', 'history'].map(key =>
-      `<button data-action="settingsTab" data-tab="${key}" class="${state.settingsTab === key ? 'active' : ''}">${key.toUpperCase()}</button>`
-    ).join('');
+  function settingsTabsHtml() {
+    const tabs = [['roster','ROSTER'],['message','MESSAGE'],['api','API'],['history','HISTORY']];
+    return `<div class="settingsTabs">${tabs.map(([key,label]) => `<button data-action="settingsTab" data-tab="${key}" class="${state.settingsTab === key ? 'active' : ''}">${label}</button>`).join('')}</div>`;
   }
 
   function rosterSettingsHtml() {
-    return `<div class="sectionTitle">Roster setup</div>
-      <textarea id="hkmcq-roster-editor" placeholder="HairyKary&#10;AngelValoel&#10;Gooey99&#10;LucianCrossborn&#10;Ziggy_Goodsbane">${escapeHtml(rosterDraft ?? state.roster.map(p => p.name).join('\n'))}</textarea>
+    return `
+      <div class="sectionTitle">Roster setup</div>
+      <textarea id="hkmcq-roster-editor" placeholder="HairyKary&#10;AngelValoel&#10;Gooey99">${escapeHtml(rosterDraft ?? state.roster.map(p => p.name).join('\n'))}</textarea>
       <div class="miniRow"><button data-action="saveRoster">SAVE ROSTER</button><button data-action="allReady">ALL READY</button></div>
       <div class="miniRow"><button data-action="resetHits">RESET PLAYER HITS</button><button data-action="resetSession">RESET SESSION</button></div>
-      <div class="help">READY players rotate normally. AFK players remain listed but are skipped. Use × to remove someone entirely.</div>`;
+      <div class="help">READY players rotate normally. AFK players stay listed but are skipped. Drag the ☰ handle with mouse or touch to reorder.</div>`;
   }
 
   function messageSettingsHtml() {
-    return `<div class="sectionTitle">Chat message template</div>
+    return `
+      <div class="sectionTitle">Chat message template</div>
       <textarea id="hkmcq-template">${escapeHtml(state.template)}</textarea>
-      <div class="help">Placeholders: {current}, {hit}, {next}, {next_hit}, {ondeck}, {ondeck_hit}, {player_hits}, {ready_count}, {total_count}, {queue}, {last_hitter}, {last_hit}</div>`;
+      <div class="help">Placeholders: {current}, {hit}, {next}, {next_hit}, {ondeck}, {ondeck_hit}, {player_hits}, {ready_count}, {total_count}, {queue}, {last_hitter}, {last_hit}, {chain_time}</div>`;
   }
 
   function apiSettingsHtml() {
-    const hasKey = !!getApiKey();
-    return `<div class="sectionTitle">API automation</div>
+    const hasKey = hasApiKey();
+    const pdaKey = !!PDA_INJECTED_KEY;
+    const sync = state.api.lastSuccessfulSync ? formatAgo(state.api.lastSuccessfulSync) : '—';
+    const backoff = Math.max(0, Math.ceil((Number(state.api.backoffUntil || 0) - Date.now()) / 1000));
+    return `
+      <div class="sectionTitle">API automation</div>
       <div class="settingsGrid">
         <select id="hkmcq-api-mode" class="full">
           <option value="manual" ${state.api.mode === 'manual' ? 'selected' : ''}>Manual — buttons only</option>
           <option value="assisted" ${state.api.mode === 'assisted' ? 'selected' : ''}>Assisted — detect hits, confirm advancement</option>
           <option value="auto" ${state.api.mode === 'auto' ? 'selected' : ''}>Auto — expected hits advance automatically</option>
         </select>
-        <input id="hkmcq-api-key" class="full" type="password" autocomplete="off"
-          placeholder="${hasKey ? 'API key saved — enter a new key only to replace it' : 'Paste Torn API key'}"
-          value="${escapeHtml(apiKeyDraft)}">
-        <label class="label">Attack check (sec)<input id="hkmcq-attack-poll" type="number" min="3" max="60" value="${state.api.attackPollSeconds}"></label>
-        <label class="label">Chain sync (sec)<input id="hkmcq-chain-poll" type="number" min="5" max="120" value="${state.api.chainPollSeconds}"></label>
+        <input id="hkmcq-api-key" class="full" type="password" autocomplete="off" ${pdaKey ? 'disabled' : ''}
+          placeholder="${pdaKey ? 'Torn PDA API key detected automatically' : hasKey ? 'API key saved — enter a new key only to replace it' : 'Paste Torn API key'}" value="${escapeHtml(apiKeyDraft)}">
+        <label class="label">Base attack check (sec)<input id="hkmcq-attack-poll" type="number" min="3" max="60" value="${state.api.attackPollSeconds}"></label>
+        <label class="label">Base chain sync (sec)<input id="hkmcq-chain-poll" type="number" min="5" max="120" value="${state.api.chainPollSeconds}"></label>
+        <label class="checkRow full"><input id="hkmcq-sound-alerts" type="checkbox" ${state.ui.soundAlerts ? 'checked' : ''}>One-time sound at chain danger thresholds</label>
+        <label class="checkRow full"><input id="hkmcq-wait-warning" type="checkbox" ${state.ui.waitWarning ? 'checked' : ''}>Warn when the same player is UP too long</label>
+        <label class="label full">Waiting warning (sec)<input id="hkmcq-wait-seconds" type="number" min="60" max="900" value="${state.ui.waitWarningSeconds}"></label>
       </div>
-      <div class="miniRow"><button data-action="saveApi">SAVE API SETTINGS</button><button data-action="testApi">TEST API</button></div>
-      <div class="miniRow"><button data-action="clearApi">REMOVE SAVED KEY</button>
-        <button data-action="resumeApi" ${state.api.paused ? '' : 'disabled'}>RESUME API</button></div>
-      <div id="hkmcq-api-status" class="apiStatusBox"></div>
-      <div class="help">The API key is stored through your userscript manager. Manual mode makes no recurring API calls.</div>`;
+      <div class="miniRow"><button data-action="saveApi">SAVE SETTINGS</button><button data-action="testApi">TEST API</button></div>
+      <div class="miniRow"><button data-action="clearApi" ${pdaKey ? 'disabled' : ''}>REMOVE SAVED KEY</button><button data-action="resumeApi" ${state.api.paused ? '' : 'disabled'}>RESUME API</button></div>
+      <div id="hkmcq-api-status" class="apiStatusBox">
+        Platform: <strong>${platformLabel()}</strong><br>
+        Key: <strong>${pdaKey ? 'Torn PDA injected' : hasKey ? 'Saved' : 'Not saved'}</strong><br>
+        Status: ${escapeHtml(state.api.status || '—')}
+        ${state.api.lastError ? `<br><span style="color:#c66">${escapeHtml(state.api.lastError)}</span>` : ''}<br>
+        Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}<br>
+        Chain clock: ${formatCountdown(remainingChainSeconds())} | Last good sync: ${sync}
+        ${backoff > 0 ? `<br>API backoff: ${backoff}s` : ''}
+        ${state.api.reconciliationNote ? `<br>Reconciliation: ${escapeHtml(state.api.reconciliationNote)}` : ''}
+      </div>
+      <div class="help">Merc-C-Que speeds up polling when the chain is under ${DANGER_SECONDS}s, slows down while hidden/inactive, retries temporary failures, and reconciles missed hits after the browser or Torn PDA resumes.</div>`;
   }
 
   function historySettingsHtml() {
-    const rows = state.ledger.length ? state.ledger.slice(0, 60).map(item =>
-      `<div class="ledgerRow"><div class="ledgerMeta">${formatTime(item.timestamp)}</div>
-       <div><strong>${escapeHtml(item.attacker)}</strong> ${item.chain ? `#${item.chain}` : ''}
-       <div class="ledgerMeta">${escapeHtml(item.kind)} • ${escapeHtml(item.mode)}${item.undone ? ' • undone' : ''}</div></div>
-       <div class="ledgerMeta">${escapeHtml(item.action)}</div></div>`
-    ).join('') : '<div style="padding:10px;color:var(--m);font-size:11px">No Merc-C-Que events recorded yet.</div>';
-
-    return `<div class="sectionTitle">Event history / diagnostics</div><div class="ledger">${rows}</div>
+    const rows = state.ledger.length
+      ? state.ledger.slice(0, 70).map(item => `
+          <div class="ledgerRow">
+            <div class="ledgerMeta">${formatTime(item.timestamp)}</div>
+            <div><strong>${escapeHtml(item.attacker)}</strong> ${item.chain ? `#${item.chain}` : ''}<div class="ledgerMeta">${escapeHtml(item.kind)} • ${escapeHtml(item.mode)}${item.undone ? ' • undone' : ''}</div></div>
+            <div class="ledgerMeta">${escapeHtml(item.action)}</div>
+          </div>`).join('')
+      : '<div style="padding:10px;color:var(--m);font-size:11px;">No Merc-C-Que events recorded yet.</div>';
+    return `
+      <div class="sectionTitle">Event history / diagnostics</div>
+      <div class="ledger">${rows}</div>
       <div class="miniRow"><button data-action="copyDebug">COPY DEBUG SNAPSHOT</button><button data-action="clearHistory">CLEAR HISTORY</button></div>
-      <div class="help">History helps troubleshoot duplicate, out-of-order, Assisted, and Auto behavior. Debug snapshots do not include your API key.</div>`;
+      <div class="help">Debug snapshots include platform, sync/backoff, chain state, queue state, pending hits, and recent events. API keys are never included.</div>`;
   }
 
   function settingsContentHtml() {
-    if (state.settingsTab === 'message') return messageSettingsHtml();
-    if (state.settingsTab === 'api') return apiSettingsHtml();
-    if (state.settingsTab === 'history') return historySettingsHtml();
-    return rosterSettingsHtml();
+    switch (state.settingsTab) {
+      case 'message': return messageSettingsHtml();
+      case 'api': return apiSettingsHtml();
+      case 'history': return historySettingsHtml();
+      case 'roster':
+      default: return rosterSettingsHtml();
+    }
   }
 
   function settingsShellHtml() {
     if (!state.setupOpen) return '';
-    return `<div class="settingsShell"><div class="settingsTabs">${tabsHtml()}</div>
-      <div id="hkmcq-settings-content">${settingsContentHtml()}</div></div>`;
-  }
-
-  function renderSettings() {
-    const slot = document.getElementById('hkmcq-settings-shell-slot');
-    if (!slot) return;
-    slot.innerHTML = settingsShellHtml();
-    updateApiStatusBox();
-    requestAnimationFrame(adjustPanelViewport);
-  }
-
-  function applyPanelPosition(panel) {
-    if (!state.position || !Number.isFinite(Number(state.position.left)) || !Number.isFinite(Number(state.position.top))) return;
-    const pos = clampPanelPosition(Number(state.position.left), Number(state.position.top), panel);
-    Object.assign(panel.style, { left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto' });
+    return `<div class="settingsShell">${settingsTabsHtml()}<div id="hkmcq-settings-content">${settingsContentHtml()}</div></div>`;
   }
 
   function renderPanel() {
@@ -1114,89 +1398,116 @@
       panel = document.createElement('div');
       panel.id = PANEL_ID;
       document.body.appendChild(panel);
-      bindPanel(panel);
     }
-
     const ready = readyParticipants();
     const nums = hitNumbers();
-    const locked = state.api.mode !== 'manual';
-
-    panel.innerHTML = `<div class="head"><div class="title">HKs Merc-C-Que
-      <div class="sub">Chain Queue Organizer • v${VERSION}</div></div>
-      <button class="icon" data-action="setup" title="Roster / message / API setup">⚙</button>
-      <button class="icon" data-action="minimize" title="Minimize Merc-C-Que">—</button></div>
+    const doneLocked = state.api.mode !== 'manual';
+    panel.innerHTML = `
+      <div class="head">
+        <div class="title">HKs Merc-C-Que<div class="sub">Chain Queue Organizer • v${VERSION} • ${IS_PDA ? 'PDA' : 'Desktop'}</div></div>
+        <button class="icon" data-action="setup" title="Roster / message / API setup">⚙</button>
+        <button class="icon" data-action="minimize" title="Minimize Merc-C-Que">—</button>
+      </div>
       <div class="main">
-      <div class="up"><div class="kicker">UP NOW</div><div class="upLine">
-        <span id="hkmcq-up-name" class="upName">${escapeHtml(ready[0]?.name || 'No READY participant')}</span>
-        <span id="hkmcq-hit-badge" class="hitBadge">• HIT #${nums.hit}</span></div></div>
-      <div class="nextGrid"><div class="label">NEXT</div><div class="nextPerson">
-        <span id="hkmcq-next-name">${escapeHtml(ready[1]?.name || '—')}</span><span id="hkmcq-next-hit" class="queueHit">HIT #${nums.nextHit}</span></div>
-        <div class="label">ON DECK</div><div class="nextPerson"><span id="hkmcq-ondeck-name">${escapeHtml(ready[2]?.name || '—')}</span>
-        <span id="hkmcq-ondeck-hit" class="queueHit">HIT #${nums.onDeckHit}</span></div></div>
-      <div id="hkmcq-pending-slot">${pendingHtml()}</div>
-      <div class="controls"><button id="hkmcq-done" class="done ${locked ? 'locked' : ''}" data-action="done"
-        title="${locked ? 'Switch API Mode to Manual to use DONE' : 'Record hit and advance'}">✓ ${locked ? 'API ACTIVE' : 'DONE'}</button>
-        <button data-action="skip">SKIP</button><button data-action="undo">↶ UNDO</button></div>
-      <div class="hitRow"><span class="label">HIT</span><input id="hkmcq-hit-number" type="number" min="1" step="1"
-        value="${nums.hit}" ${locked ? 'disabled' : ''}><span id="hkmcq-ready-count" class="label">${ready.length}/${state.roster.length} ready</span></div>
-      <div id="hkmcq-api-strip-slot">${apiStripHtml()}</div>
-      <div id="hkmcq-preview" class="preview">${escapeHtml(buildMessage())}</div>
-      <button class="copy" data-action="copy">COPY MESSAGE</button>
-      <div id="hkmcq-roster" class="roster">${rosterRowsHtml()}</div>
-      <div id="hkmcq-settings-shell-slot">${settingsShellHtml()}</div></div>`;
-
+        <div class="up">
+          <div class="kicker">UP NOW</div>
+          <div class="upLine"><span id="hkmcq-up-name" class="upName">${escapeHtml(ready[0]?.name || 'No READY participant')}</span><span id="hkmcq-hit-badge" class="hitBadge">• HIT #${nums.hit}</span></div>
+          <div id="hkmcq-wait-slot">${waitWarningHtml()}</div>
+        </div>
+        <div class="nextGrid">
+          <div class="label">NEXT</div><div class="nextPerson"><span id="hkmcq-next-name">${escapeHtml(ready[1]?.name || '—')}</span><span id="hkmcq-next-hit" class="queueHit">HIT #${nums.nextHit}</span></div>
+          <div class="label">ON DECK</div><div class="nextPerson"><span id="hkmcq-ondeck-name">${escapeHtml(ready[2]?.name || '—')}</span><span id="hkmcq-ondeck-hit" class="queueHit">HIT #${nums.onDeckHit}</span></div>
+        </div>
+        <div id="hkmcq-pending-slot">${pendingHtml()}</div>
+        <div class="controls">
+          <button id="hkmcq-done" class="done ${doneLocked ? 'locked' : ''}" data-action="done">✓ ${doneLocked ? 'API ACTIVE' : 'DONE'}</button>
+          <button data-action="skip">SKIP</button><button data-action="undo">↶ UNDO</button>
+        </div>
+        <div class="hitRow"><span class="label">HIT</span><input id="hkmcq-hit-number" type="number" min="1" step="1" value="${nums.hit}" ${state.api.mode !== 'manual' ? 'disabled' : ''}><span id="hkmcq-ready-count" class="label">${ready.length}/${state.roster.length} ready</span></div>
+        <div id="hkmcq-api-strip-slot">${apiStripHtml()}</div>
+        <div id="hkmcq-preview" class="preview">${escapeHtml(buildMessage())}</div>
+        <button class="copy" data-action="copy">COPY MESSAGE</button>
+        <div id="hkmcq-roster" class="roster">${rosterRowsHtml()}</div>
+        <div id="hkmcq-settings-shell-slot">${settingsShellHtml()}</div>
+      </div>`;
     applyPanelPosition(panel);
-    updateApiStatusBox();
+    bindPanel(panel);
     requestAnimationFrame(adjustPanelViewport);
   }
 
-  function setText(panel, selector, value) {
-    const el = panel.querySelector(selector);
-    if (el) el.textContent = value;
+  function applyPanelPosition(panel) {
+    if (state.position && Number.isFinite(Number(state.position.left)) && Number.isFinite(Number(state.position.top))) {
+      const position = clampPanelPosition(Number(state.position.left), Number(state.position.top), panel);
+      panel.style.left = `${position.left}px`;
+      panel.style.top = `${position.top}px`;
+      panel.style.right = 'auto';
+    }
   }
 
-  function refresh({ roster = false, settings = false } = {}) {
+  function renderSettings() {
+    const shellSlot = document.getElementById('hkmcq-settings-shell-slot');
+    if (!shellSlot) return;
+    shellSlot.innerHTML = settingsShellHtml();
+  }
+
+  function refresh(options = {}) {
     if (state.minimized) return renderLauncher();
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return renderPanel();
-
     const ready = readyParticipants();
     const nums = hitNumbers();
-    setText(panel, '#hkmcq-up-name', ready[0]?.name || 'No READY participant');
-    setText(panel, '#hkmcq-hit-badge', `• HIT #${nums.hit}`);
-    setText(panel, '#hkmcq-next-name', ready[1]?.name || '—');
-    setText(panel, '#hkmcq-next-hit', `HIT #${nums.nextHit}`);
-    setText(panel, '#hkmcq-ondeck-name', ready[2]?.name || '—');
-    setText(panel, '#hkmcq-ondeck-hit', `HIT #${nums.onDeckHit}`);
-    setText(panel, '#hkmcq-ready-count', `${ready.length}/${state.roster.length} ready`);
-
+    const setText = (selector, value) => {
+      const element = panel.querySelector(selector);
+      if (element) element.textContent = value;
+    };
+    setText('#hkmcq-up-name', ready[0]?.name || 'No READY participant');
+    setText('#hkmcq-hit-badge', `• HIT #${nums.hit}`);
+    setText('#hkmcq-next-name', ready[1]?.name || '—');
+    setText('#hkmcq-next-hit', `HIT #${nums.nextHit}`);
+    setText('#hkmcq-ondeck-name', ready[2]?.name || '—');
+    setText('#hkmcq-ondeck-hit', `HIT #${nums.onDeckHit}`);
+    setText('#hkmcq-ready-count', `${ready.length}/${state.roster.length} ready`);
     const hitInput = panel.querySelector('#hkmcq-hit-number');
     if (hitInput && document.activeElement !== hitInput) {
       hitInput.value = String(nums.hit);
       hitInput.disabled = state.api.mode !== 'manual';
     }
-
-    const done = panel.querySelector('#hkmcq-done');
-    if (done) {
+    const doneButton = panel.querySelector('#hkmcq-done');
+    if (doneButton) {
       const locked = state.api.mode !== 'manual';
-      done.classList.toggle('locked', locked);
-      done.textContent = `✓ ${locked ? 'API ACTIVE' : 'DONE'}`;
-      done.title = locked ? 'Switch API Mode to Manual to use DONE' : 'Record hit and advance';
+      doneButton.classList.toggle('locked', locked);
+      doneButton.textContent = `✓ ${locked ? 'API ACTIVE' : 'DONE'}`;
     }
-
-    const strip = panel.querySelector('#hkmcq-api-strip-slot');
-    if (strip) strip.innerHTML = apiStripHtml();
-    const pending = panel.querySelector('#hkmcq-pending-slot');
-    if (pending) pending.innerHTML = pendingHtml();
+    const apiStripSlot = panel.querySelector('#hkmcq-api-strip-slot');
+    if (apiStripSlot) apiStripSlot.innerHTML = apiStripHtml();
+    const pendingSlot = panel.querySelector('#hkmcq-pending-slot');
+    if (pendingSlot) pendingSlot.innerHTML = pendingHtml();
+    const waitSlot = panel.querySelector('#hkmcq-wait-slot');
+    if (waitSlot) waitSlot.innerHTML = waitWarningHtml();
     const preview = panel.querySelector('#hkmcq-preview');
     if (preview) preview.textContent = buildMessage();
-    if (roster) {
-      const rosterEl = panel.querySelector('#hkmcq-roster');
-      if (rosterEl) rosterEl.innerHTML = rosterRowsHtml();
+    if (options.roster) {
+      const roster = panel.querySelector('#hkmcq-roster');
+      if (roster) roster.innerHTML = rosterRowsHtml();
     }
-    if (settings) renderSettings();
+    if (options.settings) renderSettings();
     updateApiStatusBox();
     requestAnimationFrame(adjustPanelViewport);
+  }
+
+  function refreshLiveIndicators() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const clock = panel.querySelector('#hkmcq-chain-clock');
+    if (clock) clock.textContent = formatCountdown(remainingChainSeconds());
+    const waitSlot = panel.querySelector('#hkmcq-wait-slot');
+    if (waitSlot) waitSlot.innerHTML = waitWarningHtml();
+    const strip = panel.querySelector('.apiStrip');
+    if (strip) {
+      const remaining = remainingChainSeconds();
+      strip.classList.toggle('danger', remaining != null && remaining <= DANGER_SECONDS && remaining > CRITICAL_SECONDS);
+      strip.classList.toggle('critical', remaining != null && remaining <= CRITICAL_SECONDS);
+    }
   }
 
   function updateApiStatusBox() {
@@ -1204,22 +1515,37 @@
     if (!box) return;
     const last = state.api.lastHit ? `${state.api.lastHit.attacker} at #${state.api.lastHit.chain}` : '—';
     box.innerHTML =
-      `Key: <strong>${getApiKey() ? 'Saved' : 'Not saved'}</strong>` +
+      `Platform: <strong>${platformLabel()}</strong>` +
+      `<br>Key: <strong>${PDA_INJECTED_KEY ? 'Torn PDA injected' : hasApiKey() ? 'Saved' : 'Not saved'}</strong>` +
       `<br>Status: ${escapeHtml(state.api.status || '—')}` +
       `<br>Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}` +
-      `<br>Last detected: ${escapeHtml(last)}`;
+      `<br>Chain clock: ${formatCountdown(remainingChainSeconds())}` +
+      `<br>Last detected: ${escapeHtml(last)}` +
+      `<br>Last good sync: ${state.api.lastSuccessfulSync ? formatAgo(state.api.lastSuccessfulSync) : '—'}`;
   }
 
-  function setApiStatusText(text) {
+  function setApiUiText(text) {
     const box = document.querySelector('#hkmcq-api-status');
     if (box) box.textContent = text;
   }
 
-  function launcherClass() {
-    if (state.api.pendingHits.length) return 'pending';
-    if (state.api.paused) return 'paused';
-    if (automationActive()) return 'active';
-    return '';
+  function launcherStateClasses() {
+    const classes = [];
+    if (state.api.pendingHits.length) classes.push('pending');
+    else if (state.api.paused) classes.push('paused');
+    else if (automationActive()) classes.push('active');
+    const remaining = remainingChainSeconds();
+    if (remaining != null && remaining <= CRITICAL_SECONDS) classes.push('critical');
+    else if (remaining != null && remaining <= DANGER_SECONDS) classes.push('danger');
+    return classes.join(' ');
+  }
+
+  function launcherLabel() {
+    const current = readyParticipants()[0]?.name || '—';
+    const shortName = current.length > 13 ? `${current.slice(0, 12)}…` : current;
+    const remaining = remainingChainSeconds();
+    const clock = remaining != null ? ` • ${formatCountdown(remaining)}` : '';
+    return `${shortName} #${nextHitNumber()}${clock}`;
   }
 
   function renderLauncher() {
@@ -1231,184 +1557,210 @@
       document.body.appendChild(launcher);
       bindLauncher(launcher);
     }
-
-    launcher.className = launcherClass();
-    const pending = state.api.pendingHits.length;
-    launcher.innerHTML =
-      `<span class="launcherDot"></span><span>MCQ #${nextHitNumber()}</span>` +
-      (pending ? `<span class="launcherBadge" title="${pending} hit${pending === 1 ? '' : 's'} waiting for attention">${pending > 99 ? '99+' : pending}</span>` : '');
-
-    const ready = readyParticipants();
-    launcher.title = `Merc-C-Que — UP: ${ready[0]?.name || '—'} — HIT #${nextHitNumber()} — ${state.api.status || state.api.mode}`;
-
+    launcher.className = launcherStateClasses();
+    const pendingCount = state.api.pendingHits.length;
+    launcher.innerHTML = `
+      <span class="launcherDot"></span><span id="hkmcq-launcher-label">${escapeHtml(launcherLabel())}</span>
+      ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
+    launcher.title = `Merc-C-Que — ${launcherLabel()} — ${state.api.status || state.api.mode}`;
     const saved = state.launcherPosition;
     const initial = saved && Number.isFinite(Number(saved.left)) && Number.isFinite(Number(saved.top))
       ? { left: Number(saved.left), top: Number(saved.top) } : defaultLauncherPosition();
-    const pos = clampLauncherPosition(initial.left, initial.top, launcher);
-    Object.assign(launcher.style, {
-      left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto', bottom: 'auto'
-    });
+    const position = clampLauncherPosition(initial.left, initial.top, launcher);
+    launcher.style.left = `${position.left}px`;
+    launcher.style.top = `${position.top}px`;
+    launcher.style.right = 'auto';
+    launcher.style.bottom = 'auto';
+  }
+
+  function refreshLauncher() {
+    const launcher = document.getElementById(LAUNCHER_ID);
+    if (!launcher) return renderLauncher();
+    launcher.className = launcherStateClasses();
+    const label = launcher.querySelector('#hkmcq-launcher-label');
+    if (label) label.textContent = launcherLabel();
+    launcher.title = `Merc-C-Que — ${launcherLabel()} — ${state.api.status || state.api.mode}`;
   }
 
   function renderApp() {
     installStyle();
-    state.minimized ? renderLauncher() : renderPanel();
+    if (state.minimized) renderLauncher();
+    else renderPanel();
   }
 
   function bindPanel(panel) {
-    panel.addEventListener('click', handleClick);
-    panel.addEventListener('input', handleInput);
-    panel.addEventListener('dragstart', e => {
-      const row = e.target.closest('.row');
-      if (row) rosterDragIndex = Number(row.dataset.index);
-    });
-    panel.addEventListener('dragover', e => {
-      const row = e.target.closest('.row');
-      if (!row) return;
-      e.preventDefault();
-      row.classList.add('dragover');
-    });
-    panel.addEventListener('dragleave', e => e.target.closest('.row')?.classList.remove('dragover'));
-    panel.addEventListener('drop', e => {
-      const row = e.target.closest('.row');
-      if (!row) return;
-      e.preventDefault();
-      row.classList.remove('dragover');
-      if (rosterDragIndex !== null) moveParticipant(rosterDragIndex, Number(row.dataset.index));
-      rosterDragIndex = null;
-    });
-    panel.addEventListener('dragend', () => {
-      rosterDragIndex = null;
-      panel.querySelectorAll('.dragover').forEach(el => el.classList.remove('dragover'));
-    });
-    panel.addEventListener('mousedown', e => {
-      if (!e.target.closest('.head') || e.target.closest('button')) return;
-      const rect = panel.getBoundingClientRect();
-      panelDrag = { offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
-      e.preventDefault();
-    });
+    if (panel.dataset.hkmcqBound === '1') return;
+    panel.dataset.hkmcqBound = '1';
+    panel.addEventListener('click', handlePanelClick);
+    panel.addEventListener('input', handlePanelInput);
+    panel.addEventListener('pointerdown', handlePanelPointerDown);
   }
 
-  function handleClick(event) {
-    const el = event.target.closest('[data-action]');
-    if (!el) return;
+  function handlePanelClick(event) {
+    const element = event.target.closest('[data-action]');
+    if (!element) return;
     event.stopPropagation();
-    const action = el.dataset.action;
-    const index = Number(el.dataset.index);
-
+    const action = element.dataset.action;
+    const index = Number(element.dataset.index);
     switch (action) {
       case 'done': manualDone(); break;
       case 'skip': skipCurrent(); break;
       case 'undo': undo(); break;
-      case 'copy': copyMessage(); break;
+      case 'copy': copyText(buildMessage(), 'Merc-C-Que message copied.'); break;
       case 'status': toggleStatus(index); break;
       case 'remove': removeParticipant(index); break;
-      case 'saveRoster':
-        replaceRosterFromText(document.querySelector('#hkmcq-roster-editor')?.value || '');
+      case 'saveRoster': {
+        const editor = document.querySelector('#hkmcq-roster-editor');
+        replaceRosterFromText(editor?.value || '');
         break;
+      }
       case 'allReady': setAllReady(); break;
       case 'resetHits': resetPlayerHits(); break;
       case 'resetSession': resetSession(); break;
       case 'saveApi': saveApiSettings(); break;
-      case 'testApi': testApi(); break;
-      case 'clearApi': removeApiKey(); break;
+      case 'testApi': testApiConnection(); break;
+      case 'clearApi': removeSavedApiKey(); break;
       case 'resumeApi':
         state.api.paused = false;
         state.api.lastError = '';
         state.api.status = 'Resuming API watch…';
         state.api.lastAttackPoll = 0;
         state.api.lastChainPoll = 0;
+        state.api.backoffUntil = 0;
+        state.api.consecutiveFailures = 0;
         saveNow();
         refresh({ settings: true });
+        reconcileAfterResume('manual resume');
         break;
-      case 'confirmPending': confirmPending(el.dataset.addUnknown === '1'); break;
-      case 'ignorePending': ignorePending(); break;
+      case 'confirmPending': confirmPendingHit(element.dataset.addUnknown === '1'); break;
+      case 'ignorePending': ignorePendingHit(); break;
       case 'minimize': minimizeApp(); break;
       case 'setup':
         state.setupOpen = !state.setupOpen;
         saveNow();
         renderSettings();
+        requestAnimationFrame(adjustPanelViewport);
         break;
       case 'settingsTab':
-        state.settingsTab = el.dataset.tab;
+        state.settingsTab = element.dataset.tab;
         saveNow();
         renderSettings();
+        requestAnimationFrame(adjustPanelViewport);
         break;
       case 'copyDebug': copyText(debugSnapshot(), 'Debug snapshot copied.'); break;
       case 'clearHistory': clearLedger(); break;
     }
   }
 
-  function handleInput(event) {
-    const el = event.target;
-    if (el.matches('#hkmcq-hit-number')) {
+  function handlePanelInput(event) {
+    const target = event.target;
+    if (target.matches('#hkmcq-hit-number')) {
       if (state.api.mode !== 'manual') return;
-      state.manualNextHit = Math.max(1, Number(el.value) || 1);
+      state.manualNextHit = Math.max(1, Number(target.value) || 1);
       saveNow();
-      refresh({ roster: true });
-    } else if (el.matches('#hkmcq-template')) {
-      state.template = el.value;
+      refresh();
+      return;
+    }
+    if (target.matches('#hkmcq-template')) {
+      state.template = target.value;
       saveSoon();
       const preview = document.querySelector('#hkmcq-preview');
       if (preview) preview.textContent = buildMessage();
-    } else if (el.matches('#hkmcq-roster-editor')) {
-      rosterDraft = el.value;
-    } else if (el.matches('#hkmcq-api-key')) {
-      apiKeyDraft = el.value;
+      return;
     }
+    if (target.matches('#hkmcq-roster-editor')) {
+      rosterDraft = target.value;
+      return;
+    }
+    if (target.matches('#hkmcq-api-key')) apiKeyDraft = target.value;
+  }
+
+  function handlePanelPointerDown(event) {
+    if (event.button != null && event.button !== 0) return;
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const handle = event.target.closest('[data-drag-index]');
+    if (handle) {
+      const row = handle.closest('.row');
+      if (!row) return;
+      rosterDrag = {
+        pointerId: event.pointerId,
+        fromIndex: Number(handle.dataset.dragIndex),
+        targetIndex: Number(handle.dataset.dragIndex)
+      };
+      row.classList.add('dragging');
+      try { handle.setPointerCapture(event.pointerId); } catch {}
+      event.preventDefault();
+      return;
+    }
+    const header = event.target.closest('.head');
+    if (!header || event.target.closest('button')) return;
+    const rect = panel.getBoundingClientRect();
+    panelDrag = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top
+    };
+    try { header.setPointerCapture(event.pointerId); } catch {}
+    event.preventDefault();
   }
 
   function bindLauncher(launcher) {
-    launcher.addEventListener('mousedown', e => {
-      if (e.button !== 0) return;
+    if (launcher.dataset.hkmcqBound === '1') return;
+    launcher.dataset.hkmcqBound = '1';
+    launcher.addEventListener('pointerdown', event => {
+      if (event.button != null && event.button !== 0) return;
       const rect = launcher.getBoundingClientRect();
       launcherDrag = {
-        startX: e.clientX, startY: e.clientY,
-        offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top,
+        moved: false
       };
-      launcherDragged = false;
-      launcher.classList.add('dragging');
-      e.preventDefault();
+      try { launcher.setPointerCapture(event.pointerId); } catch {}
+      event.preventDefault();
     });
-    launcher.addEventListener('click', e => {
-      e.preventDefault();
+    launcher.addEventListener('click', event => {
+      event.preventDefault();
       if (Date.now() < suppressLauncherClickUntil) return;
       restoreApp();
     });
   }
 
-  document.addEventListener('mousemove', e => {
-    if (panelDrag) {
+  document.addEventListener('pointermove', event => {
+    if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        const pos = clampPanelPosition(
-          e.clientX - panelDrag.offsetX, e.clientY - panelDrag.offsetY, panel
-        );
-        Object.assign(panel.style, { left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto' });
+        const position = clampPanelPosition(event.clientX - panelDrag.offsetX, event.clientY - panelDrag.offsetY, panel);
+        panel.style.left = `${position.left}px`;
+        panel.style.top = `${position.top}px`;
+        panel.style.right = 'auto';
         adjustPanelViewport();
       }
     }
-
-    if (launcherDrag) {
+    if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
-        if (
-          Math.abs(e.clientX - launcherDrag.startX) > 3 ||
-          Math.abs(e.clientY - launcherDrag.startY) > 3
-        ) launcherDragged = true;
-
-        const pos = clampLauncherPosition(
-          e.clientX - launcherDrag.offsetX, e.clientY - launcherDrag.offsetY, launcher
-        );
-        Object.assign(launcher.style, {
-          left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto', bottom: 'auto'
-        });
+        if (Math.abs(event.clientX - launcherDrag.startX) > 3 || Math.abs(event.clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
+        const position = clampLauncherPosition(event.clientX - launcherDrag.offsetX, event.clientY - launcherDrag.offsetY, launcher);
+        launcher.style.left = `${position.left}px`;
+        launcher.style.top = `${position.top}px`;
+      }
+    }
+    if (rosterDrag && event.pointerId === rosterDrag.pointerId) {
+      const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(`#${PANEL_ID} .row`);
+      document.querySelectorAll(`#${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragover'));
+      if (target) {
+        target.classList.add('dragover');
+        rosterDrag.targetIndex = Number(target.dataset.index);
       }
     }
   });
 
-  document.addEventListener('mouseup', () => {
-    if (panelDrag) {
+  document.addEventListener('pointerup', event => {
+    if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
         const rect = panel.getBoundingClientRect();
@@ -1418,48 +1770,60 @@
       }
       panelDrag = null;
     }
-
-    if (launcherDrag) {
+    if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
         const rect = launcher.getBoundingClientRect();
         state.launcherPosition = { left: Math.round(rect.left), top: Math.round(rect.top) };
         saveNow();
-        launcher.classList.remove('dragging');
       }
-      if (launcherDragged) suppressLauncherClickUntil = Date.now() + 250;
+      if (launcherDrag.moved) suppressLauncherClickUntil = Date.now() + 250;
       launcherDrag = null;
-      launcherDragged = false;
     }
+    if (rosterDrag && event.pointerId === rosterDrag.pointerId) {
+      const from = rosterDrag.fromIndex;
+      const to = rosterDrag.targetIndex;
+      rosterDrag = null;
+      document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging','dragover'));
+      if (Number.isFinite(from) && Number.isFinite(to) && from !== to) moveParticipant(from, to);
+    }
+  });
+
+  document.addEventListener('pointercancel', () => {
+    panelDrag = null;
+    launcherDrag = null;
+    rosterDrag = null;
+    document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging','dragover'));
   });
 
   window.addEventListener('resize', () => {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
       const rect = panel.getBoundingClientRect();
-      const pos = clampPanelPosition(rect.left, rect.top, panel);
-      Object.assign(panel.style, { left: `${pos.left}px`, top: `${pos.top}px`, right: 'auto' });
-      state.position = { left: Math.round(pos.left), top: Math.round(pos.top) };
+      const position = clampPanelPosition(rect.left, rect.top, panel);
+      panel.style.left = `${position.left}px`;
+      panel.style.top = `${position.top}px`;
+      state.position = { left: Math.round(position.left), top: Math.round(position.top) };
       adjustPanelViewport();
     }
-
     const launcher = document.getElementById(LAUNCHER_ID);
     if (launcher) {
       const rect = launcher.getBoundingClientRect();
-      const pos = clampLauncherPosition(rect.left, rect.top, launcher);
-      Object.assign(launcher.style, { left: `${pos.left}px`, top: `${pos.top}px` });
-      state.launcherPosition = { left: Math.round(pos.left), top: Math.round(pos.top) };
+      const position = clampLauncherPosition(rect.left, rect.top, launcher);
+      launcher.style.left = `${position.left}px`;
+      launcher.style.top = `${position.top}px`;
+      state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
     }
     saveNow();
   });
 
   function toast(message) {
     document.getElementById(TOAST_ID)?.remove();
-    const el = document.createElement('div');
-    el.id = TOAST_ID;
-    el.textContent = message;
-    document.body.appendChild(el);
-    setTimeout(() => el.remove(), 1800);
+    const element = document.createElement('div');
+    element.id = TOAST_ID;
+    element.textContent = message;
+    document.body.appendChild(element);
+    setTimeout(() => element.remove(), 2200);
   }
 
   function ensureMounted() {
@@ -1473,6 +1837,25 @@
     }
   }
 
+  document.addEventListener('visibilitychange', () => {
+    const now = Date.now();
+    const gap = now - lastVisibilityChangeAt;
+    lastVisibilityChangeAt = now;
+    if (!document.hidden && gap >= 15000) {
+      reconcileAfterResume(IS_PDA ? 'Torn PDA resume' : 'tab resume');
+    }
+  });
+
+  window.addEventListener('focus', () => {
+    const sinceSync = Date.now() - Number(state.api.lastSuccessfulSync || 0);
+    if (automationActive() && sinceSync >= 20000) reconcileAfterResume('window focus');
+  });
+
+  window.addEventListener('pageshow', event => {
+    if (event.persisted && automationActive()) reconcileAfterResume('page restore');
+  });
+
+  trackUpTimer();
   renderApp();
   setInterval(ensureMounted, 2500);
   setInterval(schedulerTick, 1000);
@@ -1480,7 +1863,7 @@
   if (automationActive()) {
     state.api.lastAttackPoll = 0;
     state.api.lastChainPoll = 0;
-    if (!state.api.baselineReady) pollAttacks(true);
+    if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });
     pollChain();
   }
 })();
