@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.0
+// @version      2.5.1
 // @description  Torn faction chain queue organizer with Manual, Assisted, Auto API modes, and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.5.0';
+  const VERSION = '2.5.1';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -117,7 +117,7 @@
   let dangerAlertedForHit = null;
   let criticalAlertedForHit = null;
 
-  const clone = value => JSON.parse(JSON.stringify(value));
+  function clone(value) { return JSON.parse(JSON.stringify(value)); }
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const nowUnix = () => Math.floor(Date.now() / 1000);
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
