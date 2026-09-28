@@ -1,11 +1,14 @@
 name: Fix v2.5 startup initialization
 
 on:
-  push:
+  pull_request:
+    types: [opened, reopened, synchronize]
     branches:
-      - v2.5-pda-resilience
+      - main
     paths:
+      - HKs-Merc-C-Que.user.js
       - .github/workflows/fix-v25-startup.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,16 +28,21 @@ jobs:
           text = path.read_text(encoding='utf-8')
           old = "  const clone = value => JSON.parse(JSON.stringify(value));"
           new = "  function clone(value) { return JSON.parse(JSON.stringify(value)); }"
-          if old not in text:
-              raise SystemExit('Expected clone declaration not found')
-          text = text.replace(old, new, 1)
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('Expected clone helper not found')
           text = text.replace('// @version      2.5.0', '// @version      2.5.1', 1)
           text = text.replace("const VERSION = '2.5.0';", "const VERSION = '2.5.1';", 1)
           path.write_text(text, encoding='utf-8')
       - name: Verify JavaScript syntax
         run: node --check HKs-Merc-C-Que.user.js
-      - name: Commit fix
+      - name: Commit fix if needed
         run: |
+          if git diff --quiet; then
+            echo "Startup fix is already present."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add HKs-Merc-C-Que.user.js
