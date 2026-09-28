@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.2.0] - Beta
+
+### Added
+- Minimize Merc-C-Que to a compact MCQ launcher
+- Draggable minimized launcher with remembered screen position
+- Pending-hit badge on the minimized launcher
+
+### Changed
+- Replaced the old collapsed panel behavior with true minimize / restore behavior
+- Default minimized position avoids Torn's bottom-right chat area
+
 ## [2.1.1] - Beta
 
 ### Added
