@@ -14,12 +14,14 @@ jobs:
   patch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out hotfix branch
+        uses: actions/checkout@v4
         with:
           ref: v2.5.9-chain-idle-fix
+
       - name: Patch Merc-C-Que
-        shell: python
         run: |
+          python3 <<'PY'
           from pathlib import Path
 
           path = Path('HKs-Merc-C-Que.user.js')
@@ -29,29 +31,31 @@ jobs:
           text = text.replace("const VERSION = '2.5.8';", "const VERSION = '2.5.9';", 1)
 
           old = '''  function remainingChainSeconds() {
-    if (state.api.chainTimeout == null || !Number.isFinite(Number(state.api.chainTimeout))) {
-      return null;
-    }
-    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
-    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-    return Math.max(0, Number(state.api.chainTimeout) - elapsed);
-  }'''
+            if (state.api.chainTimeout == null || !Number.isFinite(Number(state.api.chainTimeout))) {
+              return null;
+            }
+            const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+            const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+            return Math.max(0, Number(state.api.chainTimeout) - elapsed);
+          }'''
 
           new = '''  function remainingChainSeconds() {
-    const current = Number(state.api.chainCurrent);
-    const timeout = Number(state.api.chainTimeout);
-    if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
-      return null;
-    }
-    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
-    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-    return Math.max(0, timeout - elapsed);
-  }'''
+            const current = Number(state.api.chainCurrent);
+            const timeout = Number(state.api.chainTimeout);
+            if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
+              return null;
+            }
+            const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+            const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+            return Math.max(0, timeout - elapsed);
+          }'''
 
           if old not in text:
               raise SystemExit('Expected remainingChainSeconds block not found; refusing to patch.')
 
           path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
       - name: Commit hotfix
         run: |
           git config user.name "github-actions[bot]"
