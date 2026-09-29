@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.9] - Hotfix
+
+### Chain alerts
+- Fixed inactive/neutral chains being treated as if the chain timer had reached zero
+- Danger/critical pulse, sound, and warning states now require an active chain with a positive timeout
+- Inactive chains now remain neutral and show no live chain countdown
+
 ## [2.5.8] - Release
 
 ### Desktop + Torn PDA
