@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         HKs Merc-C-Que v2.5.7 Unified Test
-// @namespace    hks-merc-c-que-unified-test
-// @version      2.5.7
-// @description  Torn faction chain queue organizer with unified Desktop/PDA support and optimized API polling.
+// @name         HKs Merc-C-Que
+// @namespace    hks-merc-c-que
+// @version      2.5.8
+// @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -15,12 +15,14 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.7';
+  const VERSION = '2.5.8';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
