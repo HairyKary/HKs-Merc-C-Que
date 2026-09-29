@@ -1,0 +1,51 @@
+name: Apply v2.5.10 warmup-neutral hotfix
+
+on:
+  push:
+    branches:
+      - v2.5.10-warmup-neutral
+    paths:
+      - .github/workflows/apply-v2.5.10-warmup-neutral.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.10-warmup-neutral
+
+      - name: Patch Merc-C-Que
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('HKs-Merc-C-Que.user.js')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = [
+              ('// @version      2.5.9', '// @version      2.5.10'),
+              ("const VERSION = '2.5.9';", "const VERSION = '2.5.10';"),
+              ('if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {',
+               'if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {'),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'Expected exactly one match for {old!r}; found {count}. Refusing to patch.')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit hotfix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HKs-Merc-C-Que.user.js
+          git commit -m "Treat chain warm-up as neutral for alerts"
+          git push origin HEAD:v2.5.10-warmup-neutral
