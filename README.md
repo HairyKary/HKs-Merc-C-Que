@@ -4,8 +4,9 @@
 
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
-> **Status:** Public Beta  
-> **Current beta:** v2.4.0  
+> **Status:** Public Release  
+> **Current version:** v2.5.8  
+> Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
 ## Features
@@ -14,7 +15,7 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - **UP NOW / NEXT / ON DECK** display
 - Hit number shown next to each queued player
 - READY / AFK status
-- Drag-and-drop queue reordering
+- Drag-and-drop queue reordering with mouse/touch/pointer support
 - Remove players who leave the queue
 - Manual, Assisted, and Auto API modes
 - Automatic detection of faction chain hits
@@ -24,8 +25,8 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Auto-mode undo that reverses the local queue change without re-detecting the same Torn hit
 - Customizable faction-chat message
 - One-click copy to clipboard
-- Scrollable floating panel
-- Minimize to a compact draggable **MCQ #hit** launcher
+- Scrollable floating panel with responsive mobile layout
+- Minimize to a compact draggable launcher showing current player, hit number, and chain clock
 - Minimized launcher remembers its screen position
 - Launcher status indicator for API active / paused / pending attention
 - Pending-hit badge while minimized
@@ -34,13 +35,20 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Copyable debug snapshot that excludes the API key
 - Dark/light friendly interface
 - Versioned saved-state migration
-- Local queue persistence between page refreshes
+- Persistent panel/minimized/launcher state across Torn navigation
+- Native Torn PDA UI-state persistence
+- Torn PDA API transport and injected-key support
+- Adaptive polling with retry/backoff and resume reconciliation
+- Reduced storage writes during unchanged API polls
+- Chain danger/critical countdown alerts with optional sound
+- Optional warning when the same player remains UP too long
 
 ## Installation
 
 ### Requirements
 
-- A userscript manager such as **Tampermonkey**
+- Desktop: a userscript manager such as **Tampermonkey**
+- Mobile: **Torn PDA** with userscript support
 - Torn.com account
 - Optional: a Torn API key with the permissions required for faction attack data
 
@@ -48,11 +56,10 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 
 1. Open the raw userscript:  
    `https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
-2. Tampermonkey should open an installation screen.
-3. Click **Install**.
-4. Refresh Torn.
+2. Install it with Tampermonkey or Torn PDA.
+3. Refresh/reopen Torn.
 
-If Tampermonkey does not open automatically, create a new userscript and paste the contents of `HKs-Merc-C-Que.user.js`.
+Desktop installs include automatic update metadata pointing to the `main` branch.
 
 ## First Setup
 
@@ -68,7 +75,7 @@ If Tampermonkey does not open automatically, create a new userscript and paste t
 
 Click the **—** button in the Merc-C-Que header to minimize the panel.
 
-Merc-C-Que becomes a small draggable launcher showing the next assigned hit number, for example `MCQ #427`. Its position is remembered after refresh. Click the launcher to restore the full panel.
+Merc-C-Que becomes a small draggable launcher showing the current queued player, assigned hit number, and chain clock when available. Its position is remembered. Click the launcher to restore the full panel.
 
 The launcher status dot indicates whether API automation is active, paused, or waiting for attention. Pending Assisted / out-of-order / unqueued hits also show a badge count.
 
@@ -88,6 +95,23 @@ When the expected **UP NOW** player makes a detected chain hit, Merc-C-Que recor
 
 Unexpected or out-of-order hits still require manual confirmation.
 
+## Desktop / Torn PDA
+
+The same userscript now supports both desktop browsers and Torn PDA.
+
+On Torn PDA, Merc-C-Que uses Torn PDA's native HTTP bridge, injected API key, and persistent PDA storage for panel/minimized/launcher UI state. On desktop, it uses the standard userscript APIs and Torn-page local storage.
+
+## Reliability / Performance
+
+Merc-C-Que includes:
+
+- Adaptive polling that speeds up near chain danger and slows while hidden/inactive
+- Retry/backoff for temporary Torn API/network failures
+- Resume/focus reconciliation after suspension
+- Processed-attack tracking to avoid duplicate queue advancement
+- Separate handling for API/network errors vs internal processing errors
+- Change-aware chain polling so unchanged polls avoid unnecessary state serialization/storage writes
+
 ## Undo Behavior
 
 Merc-C-Que keeps local queue history for manual and API-driven queue changes.
@@ -98,13 +122,15 @@ For an Auto-mode hit, **UNDO** restores the prior Merc-C-Que roster / hit-count 
 
 Open **Settings → HISTORY** to view recent Merc-C-Que events, including detected hits, Auto recordings, confirmations, ignored hits, and undone events.
 
-**COPY DEBUG SNAPSHOT** copies a compact diagnostic record containing queue state, chain state, pending hits, and recent event history. The saved Torn API key is not included.
+**COPY DEBUG SNAPSHOT** copies a compact diagnostic record containing platform, queue state, chain state, sync/backoff state, pending hits, and recent event history. The saved Torn API key is not included.
 
 ## API Key Safety
 
-Each tester should use **their own Torn API key**.
+Use **your own Torn API key**.
 
 Do not post API keys in GitHub Issues, screenshots, Discord, the repository, or script source code.
+
+On Torn PDA, the app-supplied/injected key is used automatically when available.
 
 ## Chat Message Placeholders
 
@@ -120,22 +146,22 @@ Do not post API keys in GitHub Issues, screenshots, Discord, the repository, or 
 - `{queue}`
 - `{last_hitter}`
 - `{last_hit}`
+- `{chain_time}`
 
 Example:
 
 `HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})`
 
-## Beta Testing
+## Testing
 
-See [TESTING.md](TESTING.md) for the test checklist.
+See [TESTING.md](TESTING.md) for the regression checklist used during development.
 
 ## Reporting Bugs
 
 Open a GitHub Issue and include:
 
 - Merc-C-Que version
-- Browser
-- Userscript manager/version
+- Desktop browser/userscript manager or Torn PDA version
 - API mode being used
 - What you expected
 - What happened instead
@@ -146,7 +172,7 @@ Open a GitHub Issue and include:
 
 ## Disclaimer
 
-This is an unofficial third-party userscript. Test beta versions carefully. Torn API behavior and page structure may change and can affect script functionality.
+This is an unofficial third-party userscript. Torn API behavior and page structure may change and can affect script functionality.
 
 ## Author
 
