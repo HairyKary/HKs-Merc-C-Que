@@ -1,11 +1,12 @@
-# HKs Merc-C-Que Beta Testing Checklist
+# HKs Merc-C-Que Regression Testing Checklist
 
 ## Environment
 
 - Merc-C-Que version:
-- Browser:
-- Userscript manager:
-- Desktop resolution / scaling:
+- Platform: Desktop / Torn PDA
+- Browser / Torn PDA version:
+- Userscript manager (desktop):
+- Desktop resolution / scaling (if applicable):
 - API mode tested: Manual / Assisted / Auto
 
 ## Basic Queue
@@ -16,21 +17,22 @@
 - [ ] Toggle READY -> AFK
 - [ ] Toggle AFK -> READY
 - [ ] Remove a user with X
-- [ ] Refresh Torn and confirm the queue is preserved
+- [ ] Change Torn screens and confirm the queue is preserved
 - [ ] Move the floating panel
-- [ ] Panel remains on-screen after resizing the browser
+- [ ] Panel remains on-screen after resizing/orientation changes
 
 ## Minimize / Launcher
 
 - [ ] Minimize the panel with the — button
-- [ ] Launcher shows `MCQ #<next hit>`
-- [ ] Drag the MCQ launcher to a new screen position
-- [ ] Click MCQ to restore the panel
-- [ ] Refresh while minimized and confirm launcher position is preserved
+- [ ] Launcher shows current player / next hit information
+- [ ] Drag the launcher to a new screen position
+- [ ] Click launcher to restore the panel
+- [ ] Change Torn screens while minimized and confirm minimized state is preserved
+- [ ] Launcher position is preserved across Torn navigation
+- [ ] Restored panel returns to its saved position
 - [ ] API-active launcher status indicator appears when automation is running
 - [ ] Paused indicator appears if API automation pauses
 - [ ] Pending-attention indicator / badge appears when a hit needs confirmation
-- [ ] Minimized launcher does not interfere with Torn chat after being positioned
 
 ## Settings Tabs
 
@@ -79,8 +81,6 @@
 
 ## Auto Undo Regression Test
 
-This is an important v2.4 test.
-
 1. Put the script in Auto mode.
 2. Record the current UP NOW player and their completed-hit count.
 3. Let that player make a valid chain hit.
@@ -95,6 +95,38 @@ Verify:
 - [ ] The attack is not automatically applied again on the next API poll
 - [ ] HISTORY shows the event as undone
 
+## Desktop Persistence
+
+- [ ] Full panel position survives Torn page changes
+- [ ] Minimized/open state survives Torn page changes
+- [ ] Launcher position survives Torn page changes
+- [ ] Roster/settings survive Torn page changes
+- [ ] Startup does not fall back to default state when saved data exists
+
+## Torn PDA
+
+- [ ] Header/API area identifies the platform as Torn PDA
+- [ ] Panel position persists across Torn PDA screen changes
+- [ ] Minimized/open state persists across Torn PDA screen changes
+- [ ] Launcher position persists across Torn PDA screen changes
+- [ ] Restored panel position persists
+- [ ] Roster/settings persist
+- [ ] TEST API succeeds using the Torn PDA injected API key
+- [ ] Assisted mode works
+- [ ] Auto mode works
+- [ ] Resume after app/background suspension reconciles without duplicate advancement
+
+## API Resilience / Performance
+
+- [ ] Temporary API/network failure enters retry/backoff state
+- [ ] Recovery clears the error state
+- [ ] Internal processing errors are not mislabeled as Torn API/network failures
+- [ ] No-op attack polls do not repeatedly change the queue/UI
+- [ ] No-op chain polls do not repeatedly write persistent state
+- [ ] Chain countdown remains live even when no persistent save is needed
+- [ ] Hidden/inactive polling slows down
+- [ ] Polling speeds up near chain danger thresholds
+
 ## Event History / Diagnostics
 
 - [ ] HISTORY shows recent manual and API events newest-first
@@ -103,7 +135,7 @@ Verify:
 - [ ] Ignored hits identify ignored behavior
 - [ ] Undone API queue changes identify undone behavior
 - [ ] COPY DEBUG SNAPSHOT copies valid readable JSON
-- [ ] Debug snapshot includes queue, mode, chain, pending hits, and recent history
+- [ ] Debug snapshot includes platform, queue, mode, chain, sync/backoff, pending hits, and recent history
 - [ ] Debug snapshot does **not** contain the saved Torn API key
 - [ ] CLEAR HISTORY removes only diagnostic history and does not erase the roster
 
@@ -113,20 +145,21 @@ Verify:
 - [ ] Message preview updates when manual hit number changes
 - [ ] COPY MESSAGE works
 - [ ] Custom template saves after typing
-- [ ] Template remains after page refresh
+- [ ] Template remains after navigation/refresh
 - [ ] `{current}` works
 - [ ] `{hit}` works
 - [ ] `{next}` / `{next_hit}` work
 - [ ] `{ondeck}` / `{ondeck_hit}` work
+- [ ] `{chain_time}` works
 
 ## Persistence / Migration
 
-- [ ] Existing v2.2 roster survives upgrade to v2.4
+- [ ] Existing v2.4 roster survives upgrade to v2.5.8
 - [ ] Existing READY / AFK states survive upgrade
 - [ ] Existing saved panel position survives upgrade
 - [ ] Existing launcher position survives upgrade
 - [ ] Existing API mode/settings survive upgrade
-- [ ] Refresh does not duplicate players or reset hit counts
+- [ ] Navigation does not duplicate players or reset hit counts
 
 ## Interface
 
@@ -135,6 +168,7 @@ Verify:
 - [ ] Light mode is readable
 - [ ] No important buttons are cut off
 - [ ] Roster drag/drop still works after API or settings updates
+- [ ] Mouse/touch/pointer dragging works on supported platforms
 - [ ] Clicking controls does not unexpectedly jump panel scroll position
 
 ## Bug Report Notes
@@ -144,9 +178,10 @@ Capture:
 2. Who was UP NOW.
 3. Current Torn chain number.
 4. Merc-C-Que mode.
-5. What Merc-C-Que displayed.
-6. What happened after the hit.
-7. Whether refreshing fixed it.
-8. A debug snapshot from **Settings → HISTORY → COPY DEBUG SNAPSHOT**, when useful.
+5. Desktop or Torn PDA.
+6. What Merc-C-Que displayed.
+7. What happened after the hit/navigation.
+8. Whether restarting/refreshing fixed it.
+9. A debug snapshot from **Settings → HISTORY → COPY DEBUG SNAPSHOT**, when useful.
 
 Never include your API key.
