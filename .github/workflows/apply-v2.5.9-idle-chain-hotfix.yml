@@ -1,4 +1,4 @@
-name: Apply v2.5.9 idle-chain hotfix
+name: Format v2.5.9 idle-chain hotfix
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  format:
     runs-on: ubuntu-latest
     steps:
       - name: Check out hotfix branch
@@ -19,7 +19,7 @@ jobs:
         with:
           ref: v2.5.9-chain-idle-fix
 
-      - name: Patch Merc-C-Que
+      - name: Normalize helper formatting
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -28,34 +28,32 @@ jobs:
           path = Path('HKs-Merc-C-Que.user.js')
           text = path.read_text(encoding='utf-8')
 
-          text = text.replace('// @version      2.5.8', '// @version      2.5.9', 1)
-          text = text.replace("const VERSION = '2.5.8';", "const VERSION = '2.5.9';", 1)
+          replacement = (
+              "  function remainingChainSeconds() {\n"
+              "    const current = Number(state.api.chainCurrent);\n"
+              "    const timeout = Number(state.api.chainTimeout);\n"
+              "    if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {\n"
+              "      return null;\n"
+              "    }\n"
+              "    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();\n"
+              "    const elapsed = Math.floor((Date.now() - observedAt) / 1000);\n"
+              "    return Math.max(0, timeout - elapsed);\n"
+              "  }\n\n"
+              "  function isTransientError"
+          )
 
-          replacement = '''  function remainingChainSeconds() {
-            const current = Number(state.api.chainCurrent);
-            const timeout = Number(state.api.chainTimeout);
-            if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
-              return null;
-            }
-            const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
-            const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-            return Math.max(0, timeout - elapsed);
-          }
-
-          function isTransientError'''
-
-          pattern = r'  function remainingChainSeconds\(\) \{.*?\n  \}\n\n  function isTransientError'
-          text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+          pattern = r'\s*function remainingChainSeconds\(\) \{.*?\n\}\n\nfunction isTransientError'
+          text, count = re.subn(pattern, "\n\n" + replacement, text, count=1, flags=re.S)
           if count != 1:
-              raise SystemExit(f'Expected one remainingChainSeconds block; found {count}. Refusing to patch.')
+              raise SystemExit(f'Expected one hotfix block; found {count}. Refusing to format.')
 
           path.write_text(text, encoding='utf-8')
           PY
 
-      - name: Commit hotfix
+      - name: Commit formatting cleanup
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add HKs-Merc-C-Que.user.js
-          git commit -m "Fix idle chain critical warning"
+          git commit -m "Clean up v2.5.9 hotfix formatting"
           git push origin HEAD:v2.5.9-chain-idle-fix
