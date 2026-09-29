@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.5.8] - Release
+
+### Desktop + Torn PDA
+- Unified Desktop/Tampermonkey and Torn PDA into one userscript
+- Added Torn PDA native `PDA_httpGet` transport support
+- Added Torn PDA injected API-key support with corrected placeholder detection
+- Added Torn PDA persistent minimized state, panel position, and launcher position using native PDA storage
+- Added touch/pointer-friendly dragging and responsive mobile layout
+
+### Reliability
+- Fixed startup-order bugs in `clone()`, `clamp()`, and `nowUnix()` that could cause saved state to fall back to defaults after Torn navigation
+- Preserved minimized/open state and UI positions across Torn screen changes
+- Added resume/focus reconciliation after tab or Torn PDA suspension
+- Retained processed attack IDs across chain changes to reduce duplicate/missed attack handling
+- Increased attack-feed lookback to 100 results
+- Added retry/backoff for temporary API/network failures
+- Separated API/network failures from internal Merc-C-Que processing errors
+
+### Performance
+- Added adaptive polling: faster near chain danger, slower while hidden/inactive
+- Reduced unnecessary `saveNow()` calls during unchanged API polls
+- Added change-aware chain snapshots so no-op chain polls avoid full state serialization and storage writes
+- Avoided unnecessary PDA-native storage writes during no-op polling
+
+### Chain awareness / alerts
+- Added live chain countdown
+- Added 60-second danger and 30-second critical states
+- Added optional one-time sound alerts
+- Added optional warning when the same player remains UP too long
+- Improved minimized launcher to show current player, hit number, and chain clock
+
+### Release housekeeping
+- Restored stable userscript name/namespace
+- Restored GitHub `@updateURL` / `@downloadURL` metadata
+- Confirmed v2.5.7 unified build on desktop and Torn PDA before release
+
 ## [2.4.0] - Beta
 
 ### Architecture / performance
