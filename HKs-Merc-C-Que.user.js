@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         HKs Merc-C-Que v2.5.6 Unified Test
+// @name         HKs Merc-C-Que v2.5.7 Unified Test
 // @namespace    hks-merc-c-que-unified-test
-// @version      2.5.6
-// @description  Torn faction chain queue organizer with unified Desktop and Torn PDA state/API support.
+// @version      2.5.7
+// @description  Torn faction chain queue organizer with unified Desktop/PDA support and optimized API polling.
 // @author       HairyKary
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -20,7 +20,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.6';
+  const VERSION = '2.5.7';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -883,6 +883,24 @@
     refresh({ settings: true });
   }
 
+  function handleInternalProcessingError(area, error) {
+    const message = error?.message || String(error);
+    console.error(`[Merc-C-Que] Internal ${area} processing error:`, error);
+    state.api.lastError = `Internal ${area} processing error: ${message}`;
+    state.api.status = `Merc-C-Que internal ${area} processing error`;
+    refresh({ settings: true });
+  }
+
+  function chainSnapshot() {
+    return [
+      state.api.chainId ?? '',
+      state.api.chainCurrent ?? '',
+      state.api.chainMax ?? '',
+      state.manualNextHit,
+      state.api.pendingHits.length
+    ].join('|');
+  }
+
   function processDetectedAttack(attack) {
     if (!validChainAttack(attack)) return false;
     const id = attackId(attack);
@@ -929,9 +947,21 @@
     if (Date.now() < Number(state.api.backoffUntil || 0)) return;
     attackInFlight = true;
     state.api.lastAttackPoll = Date.now();
+
+    let data;
     try {
-      const data = await fetchAttacks();
+      data = await fetchAttacks();
+    } catch (error) {
+      handleApiError(error);
+      attackInFlight = false;
+      return;
+    }
+
+    try {
       const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
+      const hadSyncError = !!state.api.lastError || state.api.consecutiveFailures > 0 || state.api.backoffUntil > 0;
+      const statusBefore = state.api.status;
+
       if (forceBaseline || !state.api.baselineReady) {
         attacks.forEach(attack => markProcessed(attackId(attack)));
         state.api.baselineReady = true;
@@ -942,26 +972,41 @@
         refresh();
         return;
       }
+
       const processed = new Set(state.api.processedAttackIds.map(String));
       const fresh = attacks
         .filter(attack => !processed.has(attackId(attack)))
         .sort((a, b) => (Number(a.ended) - Number(b.ended)) || (Number(a.chain) - Number(b.chain)) || attackId(a).localeCompare(attackId(b)));
+
       let changed = false;
       for (const attack of fresh) {
         markProcessed(attackId(attack));
         if (processDetectedAttack(attack)) changed = true;
       }
+
       if (!fresh.length) state.api.status = 'Connected — watching new faction hits';
       if (reconciliation) {
         state.api.reconciliationNote = fresh.length
           ? `Reconciled ${fresh.length} new attack${fresh.length === 1 ? '' : 's'} after resume.`
           : 'Resume reconciliation complete — no missed attacks found.';
       }
+
       recordSuccessfulSync();
-      saveNow();
-      refresh({ roster: changed, pending: changed, settings: changed });
+
+      const persistentChanged = fresh.length > 0 || reconciliation;
+      const statusChanged = state.api.status !== statusBefore;
+      const uiChanged = changed || reconciliation || hadSyncError || statusChanged;
+
+      if (persistentChanged) saveNow();
+      if (uiChanged) {
+        refresh({
+          roster: changed,
+          pending: changed,
+          settings: changed || reconciliation || hadSyncError || statusChanged
+        });
+      }
     } catch (error) {
-      handleApiError(error);
+      handleInternalProcessingError('attack', error);
     } finally {
       attackInFlight = false;
     }
@@ -972,9 +1017,21 @@
     if (Date.now() < Number(state.api.backoffUntil || 0)) return;
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
+
+    let data;
     try {
-      const data = await fetchChain();
+      data = await fetchChain();
+    } catch (error) {
+      handleApiError(error);
+      chainInFlight = false;
+      return;
+    }
+
+    try {
+      const before = chainSnapshot();
+      const hadSyncError = !!state.api.lastError || state.api.consecutiveFailures > 0 || state.api.backoffUntil > 0;
       const chain = data?.chain || null;
+
       if (chain) {
         const previousId = state.api.chainId;
         const previousCurrent = Number(state.api.chainCurrent);
@@ -1007,14 +1064,18 @@
         state.api.chainTimeout = null;
         state.api.chainTimeoutObservedAt = 0;
       }
+
       if (reconciliation) {
         state.api.reconciliationNote = state.api.reconciliationNote || 'Chain state refreshed after resume.';
       }
+
       recordSuccessfulSync();
-      saveNow();
-      refresh();
+
+      const changed = chainSnapshot() !== before;
+      if (changed || reconciliation) saveNow();
+      if (changed || reconciliation || hadSyncError) refresh();
     } catch (error) {
-      handleApiError(error);
+      handleInternalProcessingError('chain', error);
     } finally {
       chainInFlight = false;
     }
