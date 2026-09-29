@@ -1,11 +1,18 @@
-Replace YOUR_GITHUB_USERNAME with your GitHub username.
+# HKs Merc-C-Que Userscript Metadata
 
-Add these lines to the userscript metadata block:
+Release filename:
+`HKs-Merc-C-Que.user.js`
 
-// @homepageURL  https://github.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE
-// @supportURL   https://github.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/issues
-// @updateURL    https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
-// @downloadURL  https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/HKs-Merc-C-QUE/main/HKs-Merc-C-QUE.user.js
+Canonical repository:
+`https://github.com/HairyKary/HKs-Merc-C-Que`
 
-Recommended filename:
-HKs-Merc-C-QUE.user.js
+Release metadata block includes:
+
+// @name         HKs Merc-C-Que
+// @namespace    hks-merc-c-que
+// @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
+// @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+
+Current release: v2.5.8
