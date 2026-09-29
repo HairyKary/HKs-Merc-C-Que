@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         HKs Merc-C-Que
-// @namespace    hks-merc-c-que
-// @version      2.5.1
-// @description  Torn faction chain queue organizer with Manual, Assisted, Auto API modes, and Torn PDA support.
+// @name         HKs Merc-C-Que v2.5.4 Startup Fix
+// @namespace    hks-merc-c-que-v254-startup-fix
+// @version      2.5.4
+// @description  Torn faction chain queue organizer with fixed saved-state startup persistence.
 // @author       HairyKary
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -12,16 +12,15 @@
 // @grant        GM_deleteValue
 // @connect      api.torn.com
 // @run-at       document-idle
+// @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  const VERSION = '2.5.1';
+  const VERSION = '2.5.4';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -118,8 +117,8 @@
   let criticalAlertedForHit = null;
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
-  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-  const nowUnix = () => Math.floor(Date.now() / 1000);
+  function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
+  function nowUnix() { return Math.floor(Date.now() / 1000); }
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   function escapeHtml(value) {
