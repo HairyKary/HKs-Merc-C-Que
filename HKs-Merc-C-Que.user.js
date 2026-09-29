@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.8
+// @version      2.5.9
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.8';
+  const VERSION = '2.5.9';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -258,15 +258,17 @@
   }
 
   function remainingChainSeconds() {
-    if (state.api.chainTimeout == null || !Number.isFinite(Number(state.api.chainTimeout))) {
-      return null;
-    }
-    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
-    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-    return Math.max(0, Number(state.api.chainTimeout) - elapsed);
+  const current = Number(state.api.chainCurrent);
+  const timeout = Number(state.api.chainTimeout);
+  if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
+    return null;
   }
+  const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+  const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+  return Math.max(0, timeout - elapsed);
+}
 
-  function isTransientError(error) {
+function isTransientError(error) {
     const status = Number(error?.httpStatus || 0);
     return error?.transient === true || status === 0 || status === 408 || status === 429 || status >= 500;
   }
