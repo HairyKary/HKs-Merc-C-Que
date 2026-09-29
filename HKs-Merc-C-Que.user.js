@@ -258,17 +258,17 @@
   }
 
   function remainingChainSeconds() {
-  const current = Number(state.api.chainCurrent);
-  const timeout = Number(state.api.chainTimeout);
-  if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
-    return null;
+    const current = Number(state.api.chainCurrent);
+    const timeout = Number(state.api.chainTimeout);
+    if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
+      return null;
+    }
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+    return Math.max(0, timeout - elapsed);
   }
-  const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
-  const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-  return Math.max(0, timeout - elapsed);
-}
 
-function isTransientError(error) {
+  function isTransientError(error) {
     const status = Number(error?.httpStatus || 0);
     return error?.transient === true || status === 0 || status === 408 || status === 429 || status >= 500;
   }
