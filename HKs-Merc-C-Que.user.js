@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         HKs Merc-C-Que v2.5.4 Startup Fix
-// @namespace    hks-merc-c-que-v254-startup-fix
-// @version      2.5.4
-// @description  Torn faction chain queue organizer with fixed saved-state startup persistence.
+// @name         HKs Merc-C-Que v2.5.6 Unified Test
+// @namespace    hks-merc-c-que-unified-test
+// @version      2.5.6
+// @description  Torn faction chain queue organizer with unified Desktop and Torn PDA state/API support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -17,10 +17,10 @@
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
 // ==/UserScript==
 
-(() => {
+(async () => {
   'use strict';
 
-  const VERSION = '2.5.4';
+  const VERSION = '2.5.6';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -32,6 +32,10 @@
   const TOAST_ID = 'hkmcq-toast';
   const API_BASE = 'https://api.torn.com/v2';
   const PDA_API_KEY_LITERAL = '###PDA-APIKEY###';
+  const PDA_API_KEY_PLACEHOLDER = ['###PDA-', 'APIKEY###'].join('');
+  const PDA_MINIMIZED_STORE = 'ui_minimized';
+  const PDA_LAUNCHER_POSITION_STORE = 'ui_launcher_position';
+  const PDA_PANEL_POSITION_STORE = 'ui_panel_position';
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
   const MAX_PENDING = 50;
@@ -90,19 +94,44 @@
         ? globalThis.PDA_httpGet.bind(globalThis)
         : null;
 
+  const PDA_STORAGE = (() => {
+    try {
+      const candidate =
+        typeof globalThis.PDA_storage !== 'undefined'
+          ? globalThis.PDA_storage
+          : typeof window.PDA_storage !== 'undefined'
+            ? window.PDA_storage
+            : null;
+      return candidate && typeof candidate.get === 'function' && typeof candidate.set === 'function'
+        ? candidate
+        : null;
+    } catch {
+      return null;
+    }
+  })();
+
   const PDA_INJECTED_KEY =
+    PDA_HTTP_GET &&
     PDA_API_KEY_LITERAL &&
-    PDA_API_KEY_LITERAL !== '###PDA-APIKEY###'
+    PDA_API_KEY_LITERAL !== PDA_API_KEY_PLACEHOLDER
       ? PDA_API_KEY_LITERAL.trim()
       : '';
 
-  const IS_PDA = !!(PDA_HTTP_GET || PDA_INJECTED_KEY);
+  const IS_PDA = !!(PDA_HTTP_GET || PDA_STORAGE || PDA_INJECTED_KEY);
 
   let state = loadState();
+  if (PDA_STORAGE) {
+    const savedPdaUi = await loadPdaUiState();
+    if (typeof savedPdaUi.minimized === 'boolean') state.minimized = savedPdaUi.minimized;
+    if (savedPdaUi.launcherPosition) state.launcherPosition = savedPdaUi.launcherPosition;
+    if (savedPdaUi.panelPosition) state.position = savedPdaUi.panelPosition;
+  }
+
   let history = [];
   let rosterDraft = null;
   let apiKeyDraft = '';
   let saveTimer = null;
+  let pdaUiSaveChain = Promise.resolve();
   let attackInFlight = false;
   let chainInFlight = false;
   let reconciliationInFlight = false;
@@ -120,6 +149,73 @@
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
   function nowUnix() { return Math.floor(Date.now() / 1000); }
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  function normalizeStoredPosition(value) {
+    if (!value) return null;
+    try {
+      const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+      const left = Number(parsed?.left);
+      const top = Number(parsed?.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+      return { left: Math.round(left), top: Math.round(top) };
+    } catch {
+      return null;
+    }
+  }
+
+  async function pdaStorageGet(key, fallback = null) {
+    if (!PDA_STORAGE) return fallback;
+    try {
+      return await PDA_STORAGE.get(key, fallback);
+    } catch (error) {
+      console.warn(`[Merc-C-Que] PDA storage read failed for ${key}:`, error);
+      return fallback;
+    }
+  }
+
+  async function pdaStorageSet(key, value) {
+    if (!PDA_STORAGE) return false;
+    try {
+      await PDA_STORAGE.set(key, value);
+      return true;
+    } catch (error) {
+      console.warn(`[Merc-C-Que] PDA storage save failed for ${key}:`, error);
+      return false;
+    }
+  }
+
+  async function loadPdaUiState() {
+    const [minimizedRaw, launcherRaw, panelRaw] = await Promise.all([
+      pdaStorageGet(PDA_MINIMIZED_STORE, null),
+      pdaStorageGet(PDA_LAUNCHER_POSITION_STORE, null),
+      pdaStorageGet(PDA_PANEL_POSITION_STORE, null)
+    ]);
+    return {
+      minimized: typeof minimizedRaw === 'boolean' ? minimizedRaw : null,
+      launcherPosition: normalizeStoredPosition(launcherRaw),
+      panelPosition: normalizeStoredPosition(panelRaw)
+    };
+  }
+
+  function persistPdaUiState() {
+    if (!PDA_STORAGE) return;
+    const snapshot = {
+      minimized: state.minimized === true,
+      launcherPosition: normalizeStoredPosition(state.launcherPosition),
+      panelPosition: normalizeStoredPosition(state.position)
+    };
+    pdaUiSaveChain = pdaUiSaveChain
+      .catch(() => {})
+      .then(async () => {
+        await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized);
+        if (snapshot.launcherPosition) {
+          await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition));
+        }
+        if (snapshot.panelPosition) {
+          await pdaStorageSet(PDA_PANEL_POSITION_STORE, JSON.stringify(snapshot.panelPosition));
+        }
+      });
+  }
 
   function escapeHtml(value) {
     return String(value)
@@ -267,6 +363,7 @@
     } catch (error) {
       console.warn('[Merc-C-Que] State save failed:', error);
     }
+    persistPdaUiState();
   }
 
   function saveSoon(delay = 350) {
@@ -609,6 +706,7 @@
       schemaVersion: state.schemaVersion,
       generatedAt: new Date().toISOString(),
       platform: platformLabel(),
+      pdaStorage: !!PDA_STORAGE,
       mode: state.api.mode,
       paused: state.api.paused,
       chain: {
@@ -634,7 +732,9 @@
     const status = Number(response?.status ?? 200);
     const responseText = typeof response?.responseText === 'string'
       ? response.responseText
-      : typeof response === 'string' ? response : '';
+      : typeof response?.body === 'string'
+        ? response.body
+        : typeof response === 'string' ? response : '';
     let data;
     try {
       data = responseText ? JSON.parse(responseText) : response?.responseJSON || {};
@@ -1836,10 +1936,15 @@
     }
   }
 
+  window.addEventListener('pagehide', () => {
+    persistPdaUiState();
+  });
+
   document.addEventListener('visibilitychange', () => {
     const now = Date.now();
     const gap = now - lastVisibilityChangeAt;
     lastVisibilityChangeAt = now;
+    if (document.hidden) persistPdaUiState();
     if (!document.hidden && gap >= 15000) {
       reconcileAfterResume(IS_PDA ? 'Torn PDA resume' : 'tab resume');
     }
