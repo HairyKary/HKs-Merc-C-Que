@@ -219,13 +219,33 @@
       });
   }
 
+  const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
   function escapeHtml(value) {
-    return String(value)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#039;');
+    return String(value).replace(/[&<>"']/g, ch => HTML_ESCAPES[ch]);
+  }
+
+  function makeError(message, props = {}) {
+    return Object.assign(new Error(message), props);
+  }
+
+  function setPosition(element, { left, top }) {
+    element.style.left = `${left}px`;
+    element.style.top = `${top}px`;
+  }
+
+  // Skip DOM writes when generated markup has not changed.
+  const lastHtml = new WeakMap();
+  function setHtml(element, html) {
+    if (!element || lastHtml.get(element) === html) return;
+    element.innerHTML = html;
+    lastHtml.set(element, html);
+  }
+
+  function chainUrgency(remaining = remainingChainSeconds()) {
+    if (remaining == null) return '';
+    if (remaining <= CRITICAL_SECONDS) return 'critical';
+    if (remaining <= DANGER_SECONDS) return 'danger';
+    return '';
   }
 
   function formatTime(unix) {
@@ -306,20 +326,24 @@
     };
   }
 
+  function normalizeLedgerEntry(item, { id = '', mode = 'manual' } = {}) {
+    return {
+      id: String(item?.id || id),
+      attacker: String(item?.attacker || 'Unknown'),
+      chain: Number(item?.chain) || 0,
+      kind: String(item?.kind || 'unknown'),
+      expected: !!item?.expected,
+      mode: String(item?.mode || mode),
+      action: String(item?.action || 'detected'),
+      timestamp: Number(item?.timestamp) || nowUnix(),
+      result: String(item?.result || ''),
+      undone: !!item?.undone
+    };
+  }
+
   function normalizeLedger(ledger) {
     if (!Array.isArray(ledger)) return [];
-    return ledger.filter(Boolean).map(item => ({
-      id: String(item.id || ''),
-      attacker: String(item.attacker || 'Unknown'),
-      chain: Number(item.chain) || 0,
-      kind: String(item.kind || 'unknown'),
-      expected: !!item.expected,
-      mode: String(item.mode || 'manual'),
-      action: String(item.action || 'detected'),
-      timestamp: Number(item.timestamp) || nowUnix(),
-      result: String(item.result || ''),
-      undone: !!item.undone
-    })).slice(0, MAX_LEDGER);
+    return ledger.filter(Boolean).map(item => normalizeLedgerEntry(item)).slice(0, MAX_LEDGER);
   }
 
   function migrateState(saved = {}) {
@@ -672,19 +696,8 @@
   }
 
   function addLedger(entry) {
-    const id = String(entry?.id || `event-${Date.now()}`);
-    const normalized = {
-      id,
-      attacker: String(entry?.attacker || 'Unknown'),
-      chain: Number(entry?.chain) || 0,
-      kind: String(entry?.kind || 'unknown'),
-      expected: !!entry?.expected,
-      mode: String(entry?.mode || state.api.mode),
-      action: String(entry?.action || 'detected'),
-      timestamp: Number(entry?.timestamp) || nowUnix(),
-      result: String(entry?.result || ''),
-      undone: !!entry?.undone
-    };
+    const normalized = normalizeLedgerEntry(entry, { id: `event-${Date.now()}`, mode: state.api.mode });
+    const { id } = normalized;
     state.ledger = [normalized, ...state.ledger.filter(item => String(item.id) !== id)].slice(0, MAX_LEDGER);
     return normalized;
   }
@@ -743,25 +756,21 @@
     try {
       data = responseText ? JSON.parse(responseText) : response?.responseJSON || {};
     } catch {
-      const error = new Error(`API returned invalid JSON (HTTP ${status || 'unknown'}).`);
-      error.httpStatus = status;
-      error.transient = status >= 500 || status === 0;
-      throw error;
+      throw makeError(`API returned invalid JSON (HTTP ${status || 'unknown'}).`, {
+        httpStatus: status, transient: status >= 500 || status === 0
+      });
     }
     if (data?.error) {
       const code = Number(data.error.code ?? 0);
       const message = data.error.error || data.error.message || 'Unknown API error';
-      const error = new Error(`API ${code}: ${message}`);
-      error.apiCode = code;
-      error.httpStatus = status;
-      error.transient = [5, 8, 9, 10, 14, 17].includes(code);
-      throw error;
+      throw makeError(`API ${code}: ${message}`, {
+        apiCode: code, httpStatus: status, transient: [5, 8, 9, 10, 14, 17].includes(code)
+      });
     }
     if (status && (status < 200 || status >= 300)) {
-      const error = new Error(`HTTP ${status}`);
-      error.httpStatus = status;
-      error.transient = status === 408 || status === 429 || status >= 500;
-      throw error;
+      throw makeError(`HTTP ${status}`, {
+        httpStatus: status, transient: status === 408 || status === 429 || status >= 500
+      });
     }
     return data;
   }
@@ -787,9 +796,7 @@
         return parseApiResponse(response);
       } catch (error) {
         if (error?.apiCode || error?.httpStatus) throw error;
-        const wrapped = new Error(error?.message || 'Torn PDA network request failed.');
-        wrapped.transient = true;
-        throw wrapped;
+        throw makeError(error?.message || 'Torn PDA network request failed.', { transient: true });
       }
     }
     if (typeof GM_xmlhttpRequest !== 'function') {
@@ -802,17 +809,8 @@
           try { resolve(parseApiResponse(response)); }
           catch (error) { reject(error); }
         },
-        onerror: () => {
-          const error = new Error('Network error contacting api.torn.com.');
-          error.transient = true;
-          reject(error);
-        },
-        ontimeout: () => {
-          const error = new Error('Torn API request timed out.');
-          error.httpStatus = 408;
-          error.transient = true;
-          reject(error);
-        }
+        onerror: () => reject(makeError('Network error contacting api.torn.com.', { transient: true })),
+        ontimeout: () => reject(makeError('Torn API request timed out.', { httpStatus: 408, transient: true }))
       });
     });
   }
@@ -853,6 +851,22 @@
     if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return;
     state.api.pendingHits.push(event);
     state.api.pendingHits = state.api.pendingHits.slice(0, MAX_PENDING);
+  }
+
+  const hasSyncError = () =>
+    !!state.api.lastError || state.api.consecutiveFailures > 0 || state.api.backoffUntil > 0;
+  const inBackoff = () => Date.now() < Number(state.api.backoffUntil || 0);
+
+  function resetPollTimers() {
+    state.api.lastAttackPoll = 0;
+    state.api.lastChainPoll = 0;
+  }
+
+  function resetApiWatch() {
+    state.api.baselineReady = false;
+    state.api.processedAttackIds = [];
+    state.api.pendingHits = [];
+    state.api.paused = false;
   }
 
   function recordSuccessfulSync() {
@@ -948,7 +962,7 @@
 
   async function pollAttacks({ forceBaseline = false, reconciliation = false } = {}) {
     if (attackInFlight || !hasApiKey()) return;
-    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
+    if (inBackoff()) return;
     attackInFlight = true;
     state.api.lastAttackPoll = Date.now();
 
@@ -963,7 +977,7 @@
 
     try {
       const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
-      const hadSyncError = !!state.api.lastError || state.api.consecutiveFailures > 0 || state.api.backoffUntil > 0;
+      const hadSyncError = hasSyncError();
       const statusBefore = state.api.status;
 
       if (forceBaseline || !state.api.baselineReady) {
@@ -979,12 +993,14 @@
 
       const processed = new Set(state.api.processedAttackIds.map(String));
       const fresh = attacks
-        .filter(attack => !processed.has(attackId(attack)))
-        .sort((a, b) => (Number(a.ended) - Number(b.ended)) || (Number(a.chain) - Number(b.chain)) || attackId(a).localeCompare(attackId(b)));
+        .map(attack => ({ attack, id: attackId(attack) }))
+        .filter(({ id }) => !processed.has(id))
+        .sort((a, b) => (Number(a.attack.ended) - Number(b.attack.ended))
+          || (Number(a.attack.chain) - Number(b.attack.chain)) || a.id.localeCompare(b.id));
 
       let changed = false;
-      for (const attack of fresh) {
-        markProcessed(attackId(attack));
+      for (const { attack, id } of fresh) {
+        markProcessed(id);
         if (processDetectedAttack(attack)) changed = true;
       }
 
@@ -1018,7 +1034,7 @@
 
   async function pollChain({ reconciliation = false } = {}) {
     if (chainInFlight || !hasApiKey()) return;
-    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
+    if (inBackoff()) return;
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
 
@@ -1033,7 +1049,7 @@
 
     try {
       const before = chainSnapshot();
-      const hadSyncError = !!state.api.lastError || state.api.consecutiveFailures > 0 || state.api.backoffUntil > 0;
+      const hadSyncError = hasSyncError();
       const chain = data?.chain || null;
 
       if (chain) {
@@ -1129,10 +1145,7 @@
     if (newKey && !PDA_INJECTED_KEY) {
       setApiKey(newKey);
       apiKeyDraft = '';
-      state.api.baselineReady = false;
-      state.api.processedAttackIds = [];
-      state.api.pendingHits = [];
-      state.api.paused = false;
+      resetApiWatch();
     }
     const modeElement = document.querySelector('#hkmcq-api-mode');
     const attackElement = document.querySelector('#hkmcq-attack-poll');
@@ -1150,10 +1163,7 @@
       state.ui.waitWarningSeconds = clamp(Number(waitSecondsElement.value) || DEFAULT_WAIT_WARNING_SECONDS, 60, 900);
     }
     if (oldMode === 'manual' && state.api.mode !== 'manual') {
-      state.api.baselineReady = false;
-      state.api.processedAttackIds = [];
-      state.api.pendingHits = [];
-      state.api.paused = false;
+      resetApiWatch();
       state.api.status = 'Starting API watch…';
     }
     if (state.api.mode === 'manual') {
@@ -1161,8 +1171,7 @@
     } else if (!hasApiKey()) {
       state.api.status = 'API key required';
     }
-    state.api.lastAttackPoll = 0;
-    state.api.lastChainPoll = 0;
+    resetPollTimers();
     state.api.consecutiveFailures = 0;
     state.api.backoffUntil = 0;
     saveNow();
@@ -1184,16 +1193,25 @@
     clearApiKey();
     apiKeyDraft = '';
     state.api.mode = 'manual';
-    state.api.paused = false;
-    state.api.baselineReady = false;
-    state.api.processedAttackIds = [];
-    state.api.pendingHits = [];
+    resetApiWatch();
     state.api.status = 'Manual mode';
     state.api.lastError = '';
     saveNow();
     renderSettings();
     refresh();
     toast('API key removed.');
+  }
+
+  function resumeApi() {
+    state.api.paused = false;
+    state.api.lastError = '';
+    state.api.status = 'Resuming API watch…';
+    resetPollTimers();
+    state.api.backoffUntil = 0;
+    state.api.consecutiveFailures = 0;
+    saveNow();
+    refresh({ settings: true });
+    reconcileAfterResume('manual resume');
   }
 
   function confirmPendingHit(addUnknown = false) {
@@ -1227,17 +1245,7 @@
     refresh({ pending: true, settings: true });
   }
 
-  function desiredAttackPollSeconds() {
-    const base = state.api.attackPollSeconds;
-    const remaining = remainingChainSeconds();
-    if (remaining != null && remaining <= DANGER_SECONDS) return 3;
-    if (document.hidden) return Math.max(base, 15);
-    if (state.api.chainCurrent == null) return Math.max(base, 20);
-    return base;
-  }
-
-  function desiredChainPollSeconds() {
-    const base = state.api.chainPollSeconds;
+  function desiredPollSeconds(base) {
     const remaining = remainingChainSeconds();
     if (remaining != null && remaining <= DANGER_SECONDS) return 3;
     if (document.hidden) return Math.max(base, 15);
@@ -1288,11 +1296,10 @@
     runDangerAlerts();
     if (state.minimized) refreshLauncher();
     else refreshLiveIndicators();
-    if (!automationActive()) return;
-    if (Date.now() < Number(state.api.backoffUntil || 0)) return;
+    if (!automationActive() || inBackoff()) return;
     const now = Date.now();
-    if (now - Number(state.api.lastAttackPoll || 0) >= desiredAttackPollSeconds() * 1000) pollAttacks();
-    if (now - Number(state.api.lastChainPoll || 0) >= desiredChainPollSeconds() * 1000) pollChain();
+    if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
+    if (now - Number(state.api.lastChainPoll || 0) >= desiredPollSeconds(state.api.chainPollSeconds) * 1000) pollChain();
   }
 
   function detectDarkTheme() {
@@ -1426,9 +1433,7 @@
     if (!state.ui.waitWarning || !readyParticipants().length) return '';
     const seconds = upWaitingSeconds();
     if (seconds < state.ui.waitWarningSeconds) return '';
-    const minutes = Math.floor(seconds / 60);
-    const remain = seconds % 60;
-    return `<div id="hkmcq-wait-warning" class="waitWarn">Waiting ${minutes}:${String(remain).padStart(2, '0')} — consider SKIP if unavailable</div>`;
+    return `<div id="hkmcq-wait-warning" class="waitWarn">Waiting ${formatCountdown(seconds)} — consider SKIP if unavailable</div>`;
   }
 
   function pendingHtml() {
@@ -1461,8 +1466,7 @@
       ? (state.api.chainMax ? `${state.api.chainCurrent}/${state.api.chainMax}` : state.api.chainCurrent)
       : '—';
     const remaining = remainingChainSeconds();
-    const urgency = remaining != null && remaining <= CRITICAL_SECONDS ? 'critical'
-      : remaining != null && remaining <= DANGER_SECONDS ? 'danger' : '';
+    const urgency = chainUrgency(remaining);
     const paused = state.api.paused ? ' • PAUSED' : '';
     return `<div class="apiStrip ${urgency}"><strong>${mode}${paused}</strong><span>Chain ${chain}</span><span id="hkmcq-chain-clock">${formatCountdown(remaining)}</span></div>`;
   }
@@ -1601,9 +1605,7 @@
 
   function applyPanelPosition(panel) {
     if (state.position && Number.isFinite(Number(state.position.left)) && Number.isFinite(Number(state.position.top))) {
-      const position = clampPanelPosition(Number(state.position.left), Number(state.position.top), panel);
-      panel.style.left = `${position.left}px`;
-      panel.style.top = `${position.top}px`;
+      setPosition(panel, clampPanelPosition(Number(state.position.left), Number(state.position.top), panel));
       panel.style.right = 'auto';
     }
   }
@@ -1642,12 +1644,9 @@
       doneButton.classList.toggle('locked', locked);
       doneButton.textContent = `✓ ${locked ? 'API ACTIVE' : 'DONE'}`;
     }
-    const apiStripSlot = panel.querySelector('#hkmcq-api-strip-slot');
-    if (apiStripSlot) apiStripSlot.innerHTML = apiStripHtml();
-    const pendingSlot = panel.querySelector('#hkmcq-pending-slot');
-    if (pendingSlot) pendingSlot.innerHTML = pendingHtml();
-    const waitSlot = panel.querySelector('#hkmcq-wait-slot');
-    if (waitSlot) waitSlot.innerHTML = waitWarningHtml();
+    setHtml(panel.querySelector('#hkmcq-api-strip-slot'), apiStripHtml());
+    setHtml(panel.querySelector('#hkmcq-pending-slot'), pendingHtml());
+    setHtml(panel.querySelector('#hkmcq-wait-slot'), waitWarningHtml());
     const preview = panel.querySelector('#hkmcq-preview');
     if (preview) preview.textContent = buildMessage();
     if (options.roster) {
@@ -1662,15 +1661,15 @@
   function refreshLiveIndicators() {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
+    const remaining = remainingChainSeconds();
     const clock = panel.querySelector('#hkmcq-chain-clock');
-    if (clock) clock.textContent = formatCountdown(remainingChainSeconds());
-    const waitSlot = panel.querySelector('#hkmcq-wait-slot');
-    if (waitSlot) waitSlot.innerHTML = waitWarningHtml();
+    if (clock) clock.textContent = formatCountdown(remaining);
+    setHtml(panel.querySelector('#hkmcq-wait-slot'), waitWarningHtml());
     const strip = panel.querySelector('.apiStrip');
     if (strip) {
-      const remaining = remainingChainSeconds();
-      strip.classList.toggle('danger', remaining != null && remaining <= DANGER_SECONDS && remaining > CRITICAL_SECONDS);
-      strip.classList.toggle('critical', remaining != null && remaining <= CRITICAL_SECONDS);
+      const urgency = chainUrgency(remaining);
+      strip.classList.toggle('danger', urgency === 'danger');
+      strip.classList.toggle('critical', urgency === 'critical');
     }
   }
 
@@ -1698,9 +1697,8 @@
     if (state.api.pendingHits.length) classes.push('pending');
     else if (state.api.paused) classes.push('paused');
     else if (automationActive()) classes.push('active');
-    const remaining = remainingChainSeconds();
-    if (remaining != null && remaining <= CRITICAL_SECONDS) classes.push('critical');
-    else if (remaining != null && remaining <= DANGER_SECONDS) classes.push('danger');
+    const urgency = chainUrgency();
+    if (urgency) classes.push(urgency);
     return classes.join(' ');
   }
 
@@ -1723,16 +1721,15 @@
     }
     launcher.className = launcherStateClasses();
     const pendingCount = state.api.pendingHits.length;
+    const label = launcherLabel();
     launcher.innerHTML = `
-      <span class="launcherDot"></span><span id="hkmcq-launcher-label">${escapeHtml(launcherLabel())}</span>
+      <span class="launcherDot"></span><span id="hkmcq-launcher-label">${escapeHtml(label)}</span>
       ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
-    launcher.title = `Merc-C-Que — ${launcherLabel()} — ${state.api.status || state.api.mode}`;
+    launcher.title = `Merc-C-Que — ${label} — ${state.api.status || state.api.mode}`;
     const saved = state.launcherPosition;
     const initial = saved && Number.isFinite(Number(saved.left)) && Number.isFinite(Number(saved.top))
       ? { left: Number(saved.left), top: Number(saved.top) } : defaultLauncherPosition();
-    const position = clampLauncherPosition(initial.left, initial.top, launcher);
-    launcher.style.left = `${position.left}px`;
-    launcher.style.top = `${position.top}px`;
+    setPosition(launcher, clampLauncherPosition(initial.left, initial.top, launcher));
     launcher.style.right = 'auto';
     launcher.style.bottom = 'auto';
   }
@@ -1741,9 +1738,10 @@
     const launcher = document.getElementById(LAUNCHER_ID);
     if (!launcher) return renderLauncher();
     launcher.className = launcherStateClasses();
+    const text = launcherLabel();
     const label = launcher.querySelector('#hkmcq-launcher-label');
-    if (label) label.textContent = launcherLabel();
-    launcher.title = `Merc-C-Que — ${launcherLabel()} — ${state.api.status || state.api.mode}`;
+    if (label) label.textContent = text;
+    launcher.title = `Merc-C-Que — ${text} — ${state.api.status || state.api.mode}`;
   }
 
   function renderApp() {
@@ -1784,36 +1782,27 @@
       case 'saveApi': saveApiSettings(); break;
       case 'testApi': testApiConnection(); break;
       case 'clearApi': removeSavedApiKey(); break;
-      case 'resumeApi':
-        state.api.paused = false;
-        state.api.lastError = '';
-        state.api.status = 'Resuming API watch…';
-        state.api.lastAttackPoll = 0;
-        state.api.lastChainPoll = 0;
-        state.api.backoffUntil = 0;
-        state.api.consecutiveFailures = 0;
-        saveNow();
-        refresh({ settings: true });
-        reconcileAfterResume('manual resume');
-        break;
+      case 'resumeApi': resumeApi(); break;
       case 'confirmPending': confirmPendingHit(element.dataset.addUnknown === '1'); break;
       case 'ignorePending': ignorePendingHit(); break;
       case 'minimize': minimizeApp(); break;
       case 'setup':
         state.setupOpen = !state.setupOpen;
-        saveNow();
-        renderSettings();
-        requestAnimationFrame(adjustPanelViewport);
+        rerenderSettings();
         break;
       case 'settingsTab':
         state.settingsTab = element.dataset.tab;
-        saveNow();
-        renderSettings();
-        requestAnimationFrame(adjustPanelViewport);
+        rerenderSettings();
         break;
       case 'copyDebug': copyText(debugSnapshot(), 'Debug snapshot copied.'); break;
       case 'clearHistory': clearLedger(); break;
     }
+  }
+
+  function rerenderSettings() {
+    saveNow();
+    renderSettings();
+    requestAnimationFrame(adjustPanelViewport);
   }
 
   function handlePanelInput(event) {
@@ -1897,9 +1886,7 @@
     if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        const position = clampPanelPosition(event.clientX - panelDrag.offsetX, event.clientY - panelDrag.offsetY, panel);
-        panel.style.left = `${position.left}px`;
-        panel.style.top = `${position.top}px`;
+        setPosition(panel, clampPanelPosition(event.clientX - panelDrag.offsetX, event.clientY - panelDrag.offsetY, panel));
         panel.style.right = 'auto';
         adjustPanelViewport();
       }
@@ -1908,9 +1895,7 @@
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
         if (Math.abs(event.clientX - launcherDrag.startX) > 3 || Math.abs(event.clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
-        const position = clampLauncherPosition(event.clientX - launcherDrag.offsetX, event.clientY - launcherDrag.offsetY, launcher);
-        launcher.style.left = `${position.left}px`;
-        launcher.style.top = `${position.top}px`;
+        setPosition(launcher, clampLauncherPosition(event.clientX - launcherDrag.offsetX, event.clientY - launcherDrag.offsetY, launcher));
       }
     }
     if (rosterDrag && event.pointerId === rosterDrag.pointerId) {
@@ -1948,16 +1933,20 @@
       const from = rosterDrag.fromIndex;
       const to = rosterDrag.targetIndex;
       rosterDrag = null;
-      document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging','dragover'));
+      clearRosterDragClasses();
       if (Number.isFinite(from) && Number.isFinite(to) && from !== to) moveParticipant(from, to);
     }
   });
+
+  function clearRosterDragClasses() {
+    document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging', 'dragover'));
+  }
 
   document.addEventListener('pointercancel', () => {
     panelDrag = null;
     launcherDrag = null;
     rosterDrag = null;
-    document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging','dragover'));
+    clearRosterDragClasses();
   });
 
   window.addEventListener('resize', () => {
@@ -1965,8 +1954,7 @@
     if (panel) {
       const rect = panel.getBoundingClientRect();
       const position = clampPanelPosition(rect.left, rect.top, panel);
-      panel.style.left = `${position.left}px`;
-      panel.style.top = `${position.top}px`;
+      setPosition(panel, position);
       state.position = { left: Math.round(position.left), top: Math.round(position.top) };
       adjustPanelViewport();
     }
@@ -1974,11 +1962,10 @@
     if (launcher) {
       const rect = launcher.getBoundingClientRect();
       const position = clampLauncherPosition(rect.left, rect.top, launcher);
-      launcher.style.left = `${position.left}px`;
-      launcher.style.top = `${position.top}px`;
+      setPosition(launcher, position);
       state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
     }
-    saveNow();
+    saveSoon();
   });
 
   function toast(message) {
