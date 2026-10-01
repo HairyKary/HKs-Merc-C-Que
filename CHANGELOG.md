@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.5.10] - Release
+
+### Chain warm-up alerts
+- Chain danger/critical alerts now remain neutral during Torn's pre-chain warm-up (hits 1-9)
+- The live danger/critical countdown now activates only once the chain is established at hit 10 or higher
+- Preserved the existing 60-second danger and 30-second critical behavior for established chains
+
+### Refactoring / performance
+- Centralized chain urgency handling so the panel and minimized launcher use the same alert decision
+- Reduced redundant DOM writes by caching unchanged generated markup
+- Consolidated API error creation, backoff checks, polling resets, and API-watch resets into shared helpers
+- Reused calculated attack IDs during attack-feed processing
+- Consolidated repeated roster rotation/save/refresh logic and improved roster-name de-duplication
+
+### Validation
+- Confirmed the v2.5.10 warm-up behavior and normal Merc-C-Que operation on desktop/Tampermonkey
+- Confirmed the same v2.5.10 build on Torn PDA
+
 ## [2.5.9] - Hotfix
 
 ### Chain alerts

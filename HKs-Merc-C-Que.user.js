@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.9
+// @version      2.5.10
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.9';
+  const VERSION = '2.5.10';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -280,7 +280,7 @@
   function remainingChainSeconds() {
     const current = Number(state.api.chainCurrent);
     const timeout = Number(state.api.chainTimeout);
-    if (!Number.isFinite(current) || current <= 0 || !Number.isFinite(timeout) || timeout <= 0) {
+    if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {
       return null;
     }
     const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
