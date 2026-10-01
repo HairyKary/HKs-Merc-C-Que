@@ -1,0 +1,35 @@
+name: Run Fen_X refactor review
+
+on:
+  push:
+    branches:
+      - fen-refactor-review
+    paths:
+      - .github/workflows/run-fen-refactor-review.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fen-refactor-review
+
+      - name: Recover and execute patch script
+        run: |
+          python3 -c "from pathlib import Path; s=Path('.github/workflows/apply-fen-refactors.yml').read_text(); b=s.split(\"python3 <<'PY'\\n\",1)[1].rsplit('\\n          PY',1)[0]; lines=b.splitlines(); b='\\n'.join((ln[10:] if ln.startswith('          ') else ln) for ln in lines); Path('/tmp/patch.py').write_text(b+'\\n')"
+          python3 /tmp/patch.py
+          node --check HKs-Merc-C-Que.user.js
+          grep -q "current < 10" HKs-Merc-C-Que.user.js
+          grep -q "const VERSION = '2.5.10';" HKs-Merc-C-Que.user.js
+
+      - name: Commit reviewed refactors
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HKs-Merc-C-Que.user.js
+          git commit -m "Integrate reviewed Fen_X refactors"
+          git push origin HEAD:fen-refactor-review
