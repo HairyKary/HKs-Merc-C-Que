@@ -20,6 +20,7 @@ jobs:
 
       - name: Recover and execute patch script
         run: |
+          echo "Running reviewed Fen_X refactor patch"
           python3 -c "from pathlib import Path; s=Path('.github/workflows/apply-fen-refactors.yml').read_text(); b=s.split(\"python3 <<'PY'\\n\",1)[1].rsplit('\\n          PY',1)[0]; lines=b.splitlines(); b='\\n'.join((ln[10:] if ln.startswith('          ') else ln) for ln in lines); Path('/tmp/patch.py').write_text(b+'\\n')"
           python3 /tmp/patch.py
           node --check HKs-Merc-C-Que.user.js
