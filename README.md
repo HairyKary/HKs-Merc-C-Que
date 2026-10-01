@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Release  
-> **Current version:** v2.5.9  
+> **Current version:** v2.5.10  
 > Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
