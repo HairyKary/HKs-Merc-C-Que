@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.10
+// @version      2.5.11
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -15,14 +15,14 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.11-clock-safety/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.11-clock-safety/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.10';
+  const VERSION = '2.5.11';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -44,6 +44,7 @@
   const MAX_LEDGER = 200;
   const DANGER_SECONDS = 60;
   const CRITICAL_SECONDS = 30;
+  const CHAIN_CLOCK_SAFETY_SECONDS = 3;
   const DEFAULT_WAIT_WARNING_SECONDS = 240;
   const DEFAULT_TEMPLATE =
     'HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})';
@@ -285,7 +286,7 @@
     }
     const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
     const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-    return Math.max(0, timeout - elapsed);
+    return Math.max(0, timeout - elapsed - CHAIN_CLOCK_SAFETY_SECONDS);
   }
 
   function isTransientError(error) {
