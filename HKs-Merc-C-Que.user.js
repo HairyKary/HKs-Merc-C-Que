@@ -38,6 +38,7 @@
   const PDA_MINIMIZED_STORE = 'ui_minimized';
   const PDA_LAUNCHER_POSITION_STORE = 'ui_launcher_position';
   const PDA_PANEL_POSITION_STORE = 'ui_panel_position';
+  const PDA_SESSION_DISMISS_STORE = 'hkmcq_pda_launcher_dismissed';
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
   const MAX_PENDING = 50;
@@ -122,6 +123,20 @@
 
   const IS_PDA = !!(PDA_HTTP_GET || PDA_STORAGE || PDA_INJECTED_KEY);
 
+  function readPdaDismissedForSession() {
+    if (!IS_PDA) return false;
+    try { return sessionStorage.getItem(PDA_SESSION_DISMISS_STORE) === '1'; }
+    catch { return false; }
+  }
+
+  function writePdaDismissedForSession(dismissed) {
+    if (!IS_PDA) return;
+    try {
+      if (dismissed) sessionStorage.setItem(PDA_SESSION_DISMISS_STORE, '1');
+      else sessionStorage.removeItem(PDA_SESSION_DISMISS_STORE);
+    } catch {}
+  }
+
   let state = loadState();
   if (PDA_STORAGE) {
     const savedPdaUi = await loadPdaUiState();
@@ -142,7 +157,9 @@
   let launcherDrag = null;
   let rosterDrag = null;
   let suppressLauncherClickUntil = 0;
-  let launcherDismissedForSession = false;
+  let launcherDismissedForSession = readPdaDismissedForSession();
+  let pointerMoveFrame = 0;
+  let pendingPointerMove = null;
   let lastVisibilityChangeAt = Date.now();
   let lastUpName = '';
   let upSince = Date.now();
@@ -1294,12 +1311,29 @@
   function schedulerTick() {
     trackUpTimer();
     runDangerAlerts();
-    if (state.minimized) refreshLauncher();
-    else refreshLiveIndicators();
+    if (!(IS_PDA && launcherDismissedForSession)) {
+      if (state.minimized) refreshLauncher();
+      else refreshLiveIndicators();
+    }
     if (!automationActive() || inBackoff()) return;
     const now = Date.now();
     if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
     if (now - Number(state.api.lastChainPoll || 0) >= desiredPollSeconds(state.api.chainPollSeconds) * 1000) pollChain();
+  }
+
+  function schedulerDelay() {
+    const now = Date.now();
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || 0;
+    const phase = observedAt > 0 ? Math.max(0, now - observedAt) % 1000 : now % 1000;
+    return Math.max(100, 1000 - phase + 15);
+  }
+
+  function startScheduler() {
+    const run = () => {
+      schedulerTick();
+      setTimeout(run, schedulerDelay());
+    };
+    setTimeout(run, schedulerDelay());
   }
 
   function detectDarkTheme() {
@@ -1417,6 +1451,7 @@
   function dismissLauncherForSession() {
     if (!IS_PDA) return;
     launcherDismissedForSession = true;
+    writePdaDismissedForSession(true);
     launcherDrag = null;
     document.getElementById(LAUNCHER_ID)?.remove();
   }
@@ -1626,7 +1661,7 @@
   }
 
   function refresh(options = {}) {
-    if (state.minimized) return renderLauncher();
+    if (state.minimized) return refreshLauncher();
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return renderPanel();
     const ready = readyParticipants();
@@ -1749,12 +1784,32 @@
   }
 
   function refreshLauncher() {
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     const launcher = document.getElementById(LAUNCHER_ID);
     if (!launcher) return renderLauncher();
     launcher.className = launcherStateClasses();
     const text = launcherLabel();
     const label = launcher.querySelector('#hkmcq-launcher-label');
-    if (label) label.textContent = text;
+    if (label && label.textContent !== text) label.textContent = text;
+
+    const pendingCount = state.api.pendingHits.length;
+    let badge = launcher.querySelector('.launcherBadge');
+    if (pendingCount > 0) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'launcherBadge';
+        launcher.appendChild(badge);
+      }
+      const badgeText = pendingCount > 99 ? '99+' : String(pendingCount);
+      if (badge.textContent !== badgeText) badge.textContent = badgeText;
+      badge.title = `${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention`;
+    } else if (badge) {
+      badge.remove();
+    }
+
     launcher.title = `Merc-C-Que — ${text} — ${state.api.status || state.api.mode}`;
   }
 
@@ -1906,33 +1961,58 @@
     document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging', 'dragover'));
   }
 
-  document.addEventListener('pointermove', event => {
-    if (panelDrag && event.pointerId === panelDrag.pointerId) {
+  function applyPointerMove(point) {
+    if (!point) return;
+    const { pointerId, clientX, clientY } = point;
+    if (panelDrag && pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        setPosition(panel, clampPanelPosition(event.clientX - panelDrag.offsetX, event.clientY - panelDrag.offsetY, panel));
+        setPosition(panel, clampPanelPosition(clientX - panelDrag.offsetX, clientY - panelDrag.offsetY, panel));
         panel.style.right = 'auto';
         adjustPanelViewport();
       }
     }
-    if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
+    if (launcherDrag && pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
-        if (Math.abs(event.clientX - launcherDrag.startX) > 3 || Math.abs(event.clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
-        setPosition(launcher, clampLauncherPosition(event.clientX - launcherDrag.offsetX, event.clientY - launcherDrag.offsetY, launcher));
+        if (Math.abs(clientX - launcherDrag.startX) > 3 || Math.abs(clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
+        setPosition(launcher, clampLauncherPosition(clientX - launcherDrag.offsetX, clientY - launcherDrag.offsetY, launcher));
       }
     }
-    if (rosterDrag && event.pointerId === rosterDrag.pointerId) {
-      const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(`#${PANEL_ID} .row`);
+    if (rosterDrag && pointerId === rosterDrag.pointerId) {
+      const target = document.elementFromPoint(clientX, clientY)?.closest(`#${PANEL_ID} .row`);
       document.querySelectorAll(`#${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragover'));
       if (target) {
         target.classList.add('dragover');
         rosterDrag.targetIndex = Number(target.dataset.index);
       }
     }
+  }
+
+  function flushPointerMove() {
+    pointerMoveFrame = 0;
+    const point = pendingPointerMove;
+    pendingPointerMove = null;
+    applyPointerMove(point);
+  }
+
+  function flushPendingPointerMove() {
+    if (!pendingPointerMove) return;
+    if (pointerMoveFrame) cancelAnimationFrame(pointerMoveFrame);
+    flushPointerMove();
+  }
+
+  document.addEventListener('pointermove', event => {
+    pendingPointerMove = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY
+    };
+    if (!pointerMoveFrame) pointerMoveFrame = requestAnimationFrame(flushPointerMove);
   });
 
   document.addEventListener('pointerup', event => {
+    if (pendingPointerMove?.pointerId === event.pointerId) flushPendingPointerMove();
     if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
@@ -1963,6 +2043,9 @@
   });
 
   document.addEventListener('pointercancel', () => {
+    if (pointerMoveFrame) cancelAnimationFrame(pointerMoveFrame);
+    pointerMoveFrame = 0;
+    pendingPointerMove = null;
     panelDrag = null;
     launcherDrag = null;
     rosterDrag = null;
@@ -2041,7 +2124,7 @@
   trackUpTimer();
   renderApp();
   setInterval(ensureMounted, 2500);
-  setInterval(schedulerTick, 1000);
+  startScheduler();
 
   if (automationActive()) {
     resetPollTimers();
