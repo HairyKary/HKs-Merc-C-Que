@@ -1,0 +1,99 @@
+name: Apply v2.5.11 PDA launcher dismiss patch
+
+on:
+  push:
+    branches:
+      - v2.5.11-clock-safety
+    paths:
+      - .github/workflows/apply-v2.5.11-pda-dismiss.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.11-clock-safety
+
+      - name: Patch and verify userscript
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('HKs-Merc-C-Que.user.js')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "  let suppressLauncherClickUntil = 0;\n  let lastVisibilityChangeAt = Date.now();",
+              "  let suppressLauncherClickUntil = 0;\n  let launcherDismissedForSession = false;\n  let lastVisibilityChangeAt = Date.now();",
+              'session dismiss state'
+          )
+
+          replace_once(
+              "      #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}\n",
+              "      #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}\n      #${LAUNCHER_ID} .launcherClose{width:26px;height:26px;margin-left:2px;display:grid;place-items:center;border-radius:5px;font-size:17px;line-height:1;font-weight:800;opacity:.72;cursor:pointer}\n      #${LAUNCHER_ID} .launcherClose:hover{background:rgba(127,127,127,.18);opacity:1}\n",
+              'launcher close styles'
+          )
+
+          replace_once(
+              "  function restoreApp() {\n    state.minimized = false;\n    saveNow();\n    renderApp();\n  }\n",
+              "  function restoreApp() {\n    state.minimized = false;\n    saveNow();\n    renderApp();\n  }\n\n  function dismissLauncherForSession() {\n    if (!IS_PDA) return;\n    launcherDismissedForSession = true;\n    launcherDrag = null;\n    document.getElementById(LAUNCHER_ID)?.remove();\n  }\n",
+              'dismiss function'
+          )
+
+          replace_once(
+              "  function renderLauncher() {\n    document.getElementById(PANEL_ID)?.remove();\n    let launcher = document.getElementById(LAUNCHER_ID);",
+              "  function renderLauncher() {\n    document.getElementById(PANEL_ID)?.remove();\n    if (IS_PDA && launcherDismissedForSession) {\n      document.getElementById(LAUNCHER_ID)?.remove();\n      return;\n    }\n    let launcher = document.getElementById(LAUNCHER_ID);",
+              'render launcher guard'
+          )
+
+          replace_once(
+              "      <span class=\"launcherDot\"></span><span id=\"hkmcq-launcher-label\">${escapeHtml(label)}</span>\n      ${pendingCount > 0 ? `<span class=\"launcherBadge\" title=\"${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention\">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;",
+              "      <span class=\"launcherDot\"></span><span id=\"hkmcq-launcher-label\">${escapeHtml(label)}</span>\n      ${IS_PDA ? '<span class=\"launcherClose\" data-launcher-close=\"1\" role=\"button\" aria-label=\"Hide Merc-C-Que for this session\" title=\"Hide Merc-C-Que for this session\">×</span>' : ''}\n      ${pendingCount > 0 ? `<span class=\"launcherBadge\" title=\"${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention\">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;",
+              'PDA close control'
+          )
+
+          replace_once(
+              "    launcher.addEventListener('pointerdown', event => {\n      if (event.button != null && event.button !== 0) return;\n      const rect = launcher.getBoundingClientRect();",
+              "    launcher.addEventListener('pointerdown', event => {\n      if (event.target.closest?.('[data-launcher-close=\"1\"]')) return;\n      if (event.button != null && event.button !== 0) return;\n      const rect = launcher.getBoundingClientRect();",
+              'close drag protection'
+          )
+
+          replace_once(
+              "    launcher.addEventListener('click', event => {\n      event.preventDefault();\n      if (Date.now() < suppressLauncherClickUntil) return;\n      restoreApp();\n    });",
+              "    launcher.addEventListener('click', event => {\n      event.preventDefault();\n      if (event.target.closest?.('[data-launcher-close=\"1\"]')) {\n        event.stopPropagation();\n        dismissLauncherForSession();\n        return;\n      }\n      if (Date.now() < suppressLauncherClickUntil) return;\n      restoreApp();\n    });",
+              'close click handling'
+          )
+
+          replace_once(
+              "  function ensureMounted() {\n    if (!document.body) return;\n    if (state.minimized) {",
+              "  function ensureMounted() {\n    if (!document.body) return;\n    if (IS_PDA && launcherDismissedForSession) {\n      document.getElementById(PANEL_ID)?.remove();\n      document.getElementById(LAUNCHER_ID)?.remove();\n      return;\n    }\n    if (state.minimized) {",
+              'mount guard'
+          )
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          node --check HKs-Merc-C-Que.user.js
+          grep -q "launcherDismissedForSession = false" HKs-Merc-C-Que.user.js
+          grep -q "data-launcher-close" HKs-Merc-C-Que.user.js
+          grep -q "dismissLauncherForSession" HKs-Merc-C-Que.user.js
+          grep -q "CHAIN_CLOCK_SAFETY_SECONDS = 3" HKs-Merc-C-Que.user.js
+          grep -q "current < 10" HKs-Merc-C-Que.user.js
+
+      - name: Commit PDA dismiss button
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HKs-Merc-C-Que.user.js
+          git commit -m "Add temporary PDA launcher close button"
+          git push origin HEAD:v2.5.11-clock-safety
