@@ -142,6 +142,7 @@
   let launcherDrag = null;
   let rosterDrag = null;
   let suppressLauncherClickUntil = 0;
+  let launcherDismissedForSession = false;
   let lastVisibilityChangeAt = Date.now();
   let lastUpName = '';
   let upSince = Date.now();
@@ -1356,6 +1357,8 @@
       #${LAUNCHER_ID}{position:fixed;z-index:1000000;min-width:112px;min-height:42px;padding:0 11px;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid ${colors.border};border-radius:8px;background:${colors.panel2};color:${colors.text};box-shadow:0 6px 18px rgba(0,0,0,.35);font:800 11px Arial,Helvetica,sans-serif;cursor:grab;user-select:none;touch-action:none}
       #${LAUNCHER_ID}.danger{background:${colors.warn}} #${LAUNCHER_ID}.critical{background:${colors.danger};animation:hkmcqPulse 1s infinite} #${LAUNCHER_ID} .launcherDot{width:8px;height:8px;border-radius:50%;background:#777;flex:0 0 auto} #${LAUNCHER_ID}.active .launcherDot{background:#5ca85c} #${LAUNCHER_ID}.paused .launcherDot{background:#c9902f} #${LAUNCHER_ID}.pending .launcherDot{background:#c45b5b}
       #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}
+      #${LAUNCHER_ID} .launcherClose{width:26px;height:26px;margin-left:2px;display:grid;place-items:center;border-radius:5px;font-size:17px;line-height:1;font-weight:800;opacity:.72;cursor:pointer}
+      #${LAUNCHER_ID} .launcherClose:hover{background:rgba(127,127,127,.18);opacity:1}
       #${TOAST_ID}{position:fixed;right:20px;bottom:22px;z-index:1000001;background:rgba(20,20,20,.95);color:#fff;border-radius:7px;padding:9px 12px;font:13px Arial,Helvetica,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}
       @media(max-width:600px){#${PANEL_ID}{width:calc(100vw - 8px);left:4px!important;right:auto!important;top:58px;border-radius:8px;font-size:14px}#${PANEL_ID} button{min-height:40px}#${PANEL_ID} .icon,#${PANEL_ID} .remove,#${PANEL_ID} .handle{width:40px;height:40px}#${PANEL_ID} .row{grid-template-columns:40px minmax(0,1fr) 42px 62px 40px}#${PANEL_ID} .roster{max-height:36vh}#${PANEL_ID} .controls{grid-template-columns:1.45fr 1fr 1fr}#${PANEL_ID} .upName{font-size:23px}#${LAUNCHER_ID}{min-height:46px;min-width:126px}}
     `;
@@ -1409,6 +1412,13 @@
     state.minimized = false;
     saveNow();
     renderApp();
+  }
+
+  function dismissLauncherForSession() {
+    if (!IS_PDA) return;
+    launcherDismissedForSession = true;
+    launcherDrag = null;
+    document.getElementById(LAUNCHER_ID)?.remove();
   }
 
   function rosterRowsHtml() {
@@ -1711,6 +1721,10 @@
 
   function renderLauncher() {
     document.getElementById(PANEL_ID)?.remove();
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     let launcher = document.getElementById(LAUNCHER_ID);
     if (!launcher) {
       launcher = document.createElement('button');
@@ -1723,6 +1737,7 @@
     const label = launcherLabel();
     launcher.innerHTML = `
       <span class="launcherDot"></span><span id="hkmcq-launcher-label">${escapeHtml(label)}</span>
+      ${IS_PDA ? '<span class="launcherClose" data-launcher-close="1" role="button" aria-label="Hide Merc-C-Que for this session" title="Hide Merc-C-Que for this session">×</span>' : ''}
       ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
     launcher.title = `Merc-C-Que — ${label} — ${state.api.status || state.api.mode}`;
     const saved = state.launcherPosition;
@@ -1861,6 +1876,7 @@
     if (launcher.dataset.hkmcqBound === '1') return;
     launcher.dataset.hkmcqBound = '1';
     launcher.addEventListener('pointerdown', event => {
+      if (event.target.closest?.('[data-launcher-close="1"]')) return;
       if (event.button != null && event.button !== 0) return;
       const rect = launcher.getBoundingClientRect();
       launcherDrag = {
@@ -1876,6 +1892,11 @@
     });
     launcher.addEventListener('click', event => {
       event.preventDefault();
+      if (event.target.closest?.('[data-launcher-close="1"]')) {
+        event.stopPropagation();
+        dismissLauncherForSession();
+        return;
+      }
       if (Date.now() < suppressLauncherClickUntil) return;
       restoreApp();
     });
@@ -1978,6 +1999,11 @@
 
   function ensureMounted() {
     if (!document.body) return;
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(PANEL_ID)?.remove();
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     if (state.minimized) {
       if (!document.getElementById(LAUNCHER_ID)) renderLauncher();
       document.getElementById(PANEL_ID)?.remove();
