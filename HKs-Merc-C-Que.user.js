@@ -1144,11 +1144,14 @@
       const before = chainSnapshot();
       const hadSyncError = hasSyncError();
       const chain = data?.chain || null;
+      const chainCurrentValue = Number(chain?.current) || 0;
+      const chainTimeoutValue = Number(chain?.timeout) || 0;
+      const activeChain = !!chain && chainCurrentValue > 0 && chainTimeoutValue > 0;
 
-      if (chain) {
+      if (activeChain) {
         const previousId = state.api.chainId;
         const previousCurrent = Number(state.api.chainCurrent);
-        const newCurrent = Number(chain.current) || 0;
+        const newCurrent = chainCurrentValue;
         const newId = chain.id ?? null;
         const newChain = previousId != null && newId != null && String(previousId) !== String(newId);
         if (newChain) {
@@ -1159,12 +1162,13 @@
           criticalAlertedForHit = null;
         }
         const sameChain = previousId != null && newId != null && String(previousId) === String(newId);
-        const acceptedCurrent = sameChain && Number.isFinite(previousCurrent) && newCurrent < previousCurrent
+        const acceptedCurrent = sameChain && Number.isFinite(previousCurrent)
+          && previousCurrent >= 10 && newCurrent >= 10 && newCurrent < previousCurrent
           ? previousCurrent : newCurrent;
         state.api.chainId = newId;
         state.api.chainCurrent = acceptedCurrent;
         state.api.chainMax = Number(chain.max) || 0;
-        state.api.chainTimeout = Number(chain.timeout);
+        state.api.chainTimeout = chainTimeoutValue;
         state.api.chainTimeoutObservedAt = Date.now();
         updateChainDeadline(chain, requestStartedAt, requestFinishedAt);
         state.manualNextHit = acceptedCurrent + 1;
@@ -1177,7 +1181,10 @@
         state.api.chainMax = null;
         state.api.chainTimeout = null;
         state.api.chainTimeoutObservedAt = 0;
+        state.manualNextHit = 1;
         chainDeadlineTornMs = 0;
+        dangerAlertedForHit = null;
+        criticalAlertedForHit = null;
       }
 
       if (reconciliation) {
