@@ -1,0 +1,42 @@
+name: Build v2.5.13 PDA tempo bulk
+
+on:
+  push:
+    branches:
+      - v2.5.13-pda-tempo-bulk
+    paths:
+      - .github/workflows/build-v2.5.13.yml
+      - .github/scripts/build-v2.5.13.py
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.13-pda-tempo-bulk
+      - name: Apply v2.5.13 patch
+        run: python3 .github/scripts/build-v2.5.13.py
+      - name: Verify userscript
+        run: |
+          node --check HKs-Merc-C-Que.user.js
+          git diff --check
+          grep -q "@version      2.5.13" HKs-Merc-C-Que.user.js
+          grep -q "const VERSION = '2.5.13'" HKs-Merc-C-Que.user.js
+          grep -q "recordAllPendingHits" HKs-Merc-C-Que.user.js
+          grep -q "hitTempoState" HKs-Merc-C-Que.user.js
+          grep -q "compactPanel" HKs-Merc-C-Que.user.js
+          if git diff --quiet -- HKs-Merc-C-Que.user.js; then
+            echo 'No userscript changes were produced.' >&2
+            exit 1
+          fi
+      - name: Commit v2.5.13 test build
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HKs-Merc-C-Que.user.js
+          git commit -m 'Build v2.5.13 compact PDA tempo and bulk actions'
+          git push origin v2.5.13-pda-tempo-bulk
