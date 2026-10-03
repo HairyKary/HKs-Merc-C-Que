@@ -1874,6 +1874,7 @@
         Key: <strong>${pdaKey ? 'Torn PDA injected' : hasKey ? 'Saved' : 'Not saved'}</strong><br>
         Status: ${escapeHtml(state.api.status || '—')}
         ${state.api.lastError ? `<br><span style="color:#c66">${escapeHtml(state.api.lastError)}</span>` : ''}<br>
+        Tab API role: <strong>${tabApiRole()}</strong><br>
         Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}<br>
         Chain clock: ${formatCountdown(remainingChainSeconds())} | Last good sync: ${sync}
         ${backoff > 0 ? `<br>API backoff: ${backoff}s` : ''}
