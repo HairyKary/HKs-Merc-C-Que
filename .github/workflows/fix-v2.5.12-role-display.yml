@@ -1,0 +1,44 @@
+name: Fix v2.5.12 role display
+
+on:
+  push:
+    branches:
+      - v2.5.12-multitab-sync
+    paths:
+      - .github/workflows/fix-v2.5.12-role-display.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.12-multitab-sync
+      - name: Add initial role line
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('HKs-Merc-C-Que.user.js')
+          s=p.read_text(encoding='utf-8')
+          old="""        Status: ${escapeHtml(state.api.status || '—')}
+        ${state.api.lastError ? `<br><span style=\"color:#c66\">${escapeHtml(state.api.lastError)}</span>` : ''}<br>
+        Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}<br>"""
+          new="""        Status: ${escapeHtml(state.api.status || '—')}
+        ${state.api.lastError ? `<br><span style=\"color:#c66\">${escapeHtml(state.api.lastError)}</span>` : ''}<br>
+        Tab API role: <strong>${tabApiRole()}</strong><br>
+        Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}<br>"""
+          if s.count(old)!=1: raise SystemExit(f'expected 1 role display anchor, found {s.count(old)}')
+          p.write_text(s.replace(old,new,1),encoding='utf-8')
+          PY
+          node --check HKs-Merc-C-Que.user.js
+          grep -Fq 'Tab API role: <strong>${tabApiRole()}</strong><br>' HKs-Merc-C-Que.user.js
+      - name: Commit role display fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HKs-Merc-C-Que.user.js
+          git commit -m 'Show tab API role when settings open'
+          git push origin HEAD:v2.5.12-multitab-sync
