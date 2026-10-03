@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.11
+// @version      2.5.12
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -15,14 +15,14 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.12-multitab-sync/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.12-multitab-sync/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.11';
+  const VERSION = '2.5.12';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -39,6 +39,11 @@
   const PDA_LAUNCHER_POSITION_STORE = 'ui_launcher_position';
   const PDA_PANEL_POSITION_STORE = 'ui_panel_position';
   const PDA_SESSION_DISMISS_STORE = 'hkmcq_pda_launcher_dismissed';
+  const TAB_SYNC_CHANNEL_NAME = 'hksMercCQue_v2_tab_sync';
+  const TAB_SHARED_STATE_STORE = 'hksMercCQue_v2_shared_state';
+  const TAB_LEADER_STORE = 'hksMercCQue_v2_api_leader';
+  const API_LEADER_LEASE_MS = 4000;
+  const API_LEADER_RENEW_MS = 1200;
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
   const MAX_PENDING = 50;
@@ -170,6 +175,16 @@
   let tornClockSyncedAt = 0;
   let tornClockSyncInFlight = false;
   let chainDeadlineTornMs = 0;
+  const TAB_ID = (() => {
+    try { if (crypto?.randomUUID) return crypto.randomUUID(); } catch {}
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  })();
+  let syncChannel = null;
+  let sharedSequence = 0;
+  let lastSharedStamp = { updatedAt: 0, sourceId: '', sequence: 0 };
+  let lastPublishedSharedJson = '';
+  let lastLeaderRenewAt = 0;
+  let wasApiLeader = false;
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
@@ -442,6 +457,191 @@
     return clone(DEFAULT_STATE);
   }
 
+  function buildSharedSnapshot() {
+    const api = clone(state.api);
+    delete api.lastAttackPoll;
+    delete api.lastChainPoll;
+    return {
+      schemaVersion: state.schemaVersion,
+      roster: clone(state.roster),
+      manualNextHit: state.manualNextHit,
+      template: state.template,
+      ui: clone(state.ui),
+      ledger: clone(state.ledger),
+      api,
+      history: clone(history),
+      runtime: {
+        lastUpName,
+        upSince,
+        tornClockOffsetMs,
+        tornClockSyncedAt,
+        chainDeadlineTornMs,
+        dangerAlertedForHit,
+        criticalAlertedForHit
+      }
+    };
+  }
+
+  function sharedStampIsNewer(envelope) {
+    const updatedAt = Number(envelope?.updatedAt) || 0;
+    const sourceId = String(envelope?.sourceId || '');
+    const sequence = Number(envelope?.sequence) || 0;
+    if (updatedAt !== lastSharedStamp.updatedAt) return updatedAt > lastSharedStamp.updatedAt;
+    if (sourceId !== lastSharedStamp.sourceId) return sourceId > lastSharedStamp.sourceId;
+    return sequence > lastSharedStamp.sequence;
+  }
+
+  function recordSharedStamp(envelope) {
+    lastSharedStamp = {
+      updatedAt: Number(envelope?.updatedAt) || 0,
+      sourceId: String(envelope?.sourceId || ''),
+      sequence: Number(envelope?.sequence) || 0
+    };
+  }
+
+  function publishSharedState(force = false) {
+    const snapshot = buildSharedSnapshot();
+    const snapshotJson = JSON.stringify(snapshot);
+    if (!force && snapshotJson === lastPublishedSharedJson) return;
+
+    const envelope = {
+      type: 'state',
+      sourceId: TAB_ID,
+      updatedAt: Date.now(),
+      sequence: ++sharedSequence,
+      snapshot
+    };
+    lastPublishedSharedJson = snapshotJson;
+    recordSharedStamp(envelope);
+
+    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(envelope)); }
+    catch (error) { console.warn('[Merc-C-Que] Shared-state save failed:', error); }
+    try { syncChannel?.postMessage(envelope); } catch {}
+  }
+
+  function applySharedEnvelope(envelope) {
+    if (!envelope || envelope.type !== 'state' || envelope.sourceId === TAB_ID) return false;
+    if (!sharedStampIsNewer(envelope)) return false;
+    const shared = envelope.snapshot;
+    if (!shared || typeof shared !== 'object') return false;
+
+    const lastAttackPoll = state.api.lastAttackPoll;
+    const lastChainPoll = state.api.lastChainPoll;
+    state.roster = Array.isArray(shared.roster) ? shared.roster.map(normalizeParticipant) : state.roster;
+    state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
+    state.template = typeof shared.template === 'string' ? shared.template : state.template;
+    state.ui = { ...state.ui, ...(shared.ui || {}) };
+    state.ledger = normalizeLedger(shared.ledger);
+    state.api = normalizeApi({
+      ...state.api,
+      ...(shared.api || {}),
+      lastAttackPoll,
+      lastChainPoll
+    });
+    history = Array.isArray(shared.history) ? clone(shared.history).slice(-MAX_HISTORY) : history;
+
+    const runtime = shared.runtime || {};
+    lastUpName = String(runtime.lastUpName || '');
+    upSince = Number(runtime.upSince) || Date.now();
+    tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
+    tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
+    chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
+    dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
+    criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+
+    recordSharedStamp(envelope);
+    lastPublishedSharedJson = JSON.stringify(buildSharedSnapshot());
+    refresh({ roster: true, pending: true, settings: true });
+    return true;
+  }
+
+  function initTabSync() {
+    try {
+      if (typeof BroadcastChannel === 'function') {
+        syncChannel = new BroadcastChannel(TAB_SYNC_CHANNEL_NAME);
+        syncChannel.addEventListener('message', event => applySharedEnvelope(event.data));
+      }
+    } catch (error) {
+      console.warn('[Merc-C-Que] BroadcastChannel unavailable; using storage sync:', error);
+      syncChannel = null;
+    }
+
+    window.addEventListener('storage', event => {
+      if (event.key !== TAB_SHARED_STATE_STORE || !event.newValue) return;
+      try { applySharedEnvelope(JSON.parse(event.newValue)); } catch {}
+    });
+
+    let existing = null;
+    try {
+      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
+      if (raw) existing = JSON.parse(raw);
+    } catch {}
+    if (!applySharedEnvelope(existing)) publishSharedState(true);
+  }
+
+  function readApiLeaderLease() {
+    try {
+      const raw = localStorage.getItem(TAB_LEADER_STORE);
+      if (!raw) return null;
+      const lease = JSON.parse(raw);
+      return lease && lease.id ? lease : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isApiLeader() {
+    const lease = readApiLeaderLease();
+    return !!lease && lease.id === TAB_ID && Number(lease.expiresAt) > Date.now();
+  }
+
+  function releaseApiLeadership() {
+    const lease = readApiLeaderLease();
+    if (lease?.id === TAB_ID) {
+      try { localStorage.removeItem(TAB_LEADER_STORE); } catch {}
+    }
+    wasApiLeader = false;
+    lastLeaderRenewAt = 0;
+  }
+
+  function maintainApiLeadership() {
+    if (!automationActive()) {
+      releaseApiLeadership();
+      return false;
+    }
+
+    const now = Date.now();
+    const lease = readApiLeaderLease();
+    if (lease?.id === TAB_ID && Number(lease.expiresAt) > now) {
+      if (now - lastLeaderRenewAt >= API_LEADER_RENEW_MS) {
+        const renewed = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS };
+        try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(renewed)); } catch {}
+        lastLeaderRenewAt = now;
+      }
+      wasApiLeader = true;
+      return true;
+    }
+
+    if (lease?.id && Number(lease.expiresAt) > now) {
+      wasApiLeader = false;
+      return false;
+    }
+
+    const candidate = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS };
+    try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(candidate)); } catch {}
+    const confirmed = readApiLeaderLease();
+    const won = confirmed?.id === TAB_ID && Number(confirmed.expiresAt) > now;
+    if (won && !wasApiLeader) resetPollTimers();
+    wasApiLeader = won;
+    if (won) lastLeaderRenewAt = now;
+    return won;
+  }
+
+  function tabApiRole() {
+    if (!automationActive()) return '—';
+    return isApiLeader() ? 'LEADER' : 'FOLLOWER';
+  }
+
   function saveNow() {
     clearTimeout(saveTimer);
     saveTimer = null;
@@ -452,6 +652,7 @@
       console.warn('[Merc-C-Que] State save failed:', error);
     }
     persistPdaUiState();
+    publishSharedState();
   }
 
   function saveSoon(delay = 350) {
@@ -782,6 +983,7 @@
       generatedAt: new Date().toISOString(),
       platform: platformLabel(),
       pdaStorage: !!PDA_STORAGE,
+      tabSync: { tabId: TAB_ID, apiRole: tabApiRole(), broadcastChannel: !!syncChannel },
       mode: state.api.mode,
       paused: state.api.paused,
       chain: {
@@ -888,7 +1090,7 @@
   }
 
   async function syncTornClock({ force = false } = {}) {
-    if (!hasApiKey() || tornClockSyncInFlight) return false;
+    if (!isApiLeader() || !hasApiKey() || tornClockSyncInFlight) return false;
     const now = Date.now();
     if (!force && tornClockSyncedAt && now - tornClockSyncedAt < TORN_CLOCK_SYNC_INTERVAL_MS) return true;
 
@@ -1051,7 +1253,7 @@
   }
 
   async function pollAttacks({ forceBaseline = false, reconciliation = false } = {}) {
-    if (attackInFlight || !hasApiKey()) return;
+    if (!isApiLeader() || attackInFlight || !hasApiKey()) return;
     if (inBackoff()) return;
     attackInFlight = true;
     state.api.lastAttackPoll = Date.now();
@@ -1066,6 +1268,7 @@
     }
 
     try {
+      if (!isApiLeader()) return;
       const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
       const hadSyncError = hasSyncError();
       const statusBefore = state.api.status;
@@ -1123,7 +1326,7 @@
   }
 
   async function pollChain({ reconciliation = false } = {}) {
-    if (chainInFlight || !hasApiKey()) return;
+    if (!isApiLeader() || chainInFlight || !hasApiKey()) return;
     if (inBackoff()) return;
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
@@ -1141,6 +1344,7 @@
     }
 
     try {
+      if (!isApiLeader()) return;
       const before = chainSnapshot();
       const hadSyncError = hasSyncError();
       const chain = data?.chain || null;
@@ -1205,6 +1409,10 @@
 
   async function reconcileAfterResume(reason = 'resume') {
     if (reconciliationInFlight || !automationActive()) return;
+    if (!maintainApiLeadership()) {
+      refresh({ settings: true });
+      return;
+    }
     reconciliationInFlight = true;
     state.api.status = `Rechecking Torn after ${reason}…`;
     refresh();
@@ -1281,7 +1489,7 @@
     renderSettings();
     refresh();
     toast('API settings saved.');
-    if (automationActive()) {
+    if (automationActive() && maintainApiLeadership()) {
       syncTornClock().finally(() => pollChain());
       pollAttacks({ forceBaseline: !state.api.baselineReady });
     }
@@ -1396,12 +1604,13 @@
 
   function schedulerTick() {
     trackUpTimer();
-    runDangerAlerts();
+    const leader = maintainApiLeadership();
+    if (leader) runDangerAlerts();
     if (!(IS_PDA && launcherDismissedForSession)) {
       if (state.minimized) refreshLauncher();
       else refreshLiveIndicators();
     }
-    if (!automationActive() || inBackoff()) return;
+    if (!automationActive() || !leader || inBackoff()) return;
     const now = Date.now();
     if (!tornClockSyncedAt || now - tornClockSyncedAt >= TORN_CLOCK_SYNC_INTERVAL_MS) syncTornClock();
     if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
@@ -1817,6 +2026,7 @@
       `Platform: <strong>${platformLabel()}</strong>` +
       `<br>Key: <strong>${PDA_INJECTED_KEY ? 'Torn PDA injected' : hasApiKey() ? 'Saved' : 'Not saved'}</strong>` +
       `<br>Status: ${escapeHtml(state.api.status || '—')}` +
+      `<br>Tab API role: <strong>${tabApiRole()}</strong>` +
       `<br>Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}` +
       `<br>Chain clock: ${formatCountdown(remainingChainSeconds())}` +
       `<br>Last detected: ${escapeHtml(last)}` +
@@ -2192,6 +2402,7 @@
     // Flush any debounced save; saveNow() also persists PDA UI state.
     if (saveTimer) saveNow();
     else persistPdaUiState();
+    releaseApiLeadership();
   });
 
   document.addEventListener('visibilitychange', () => {
@@ -2213,12 +2424,13 @@
     if (event.persisted && automationActive()) reconcileAfterResume('page restore');
   });
 
+  initTabSync();
   trackUpTimer();
   renderApp();
   setInterval(ensureMounted, 2500);
   startScheduler();
 
-  if (automationActive()) {
+  if (automationActive() && maintainApiLeadership()) {
     resetPollTimers();
     if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });
     syncTornClock({ force: true }).finally(() => pollChain());
