@@ -46,6 +46,7 @@
   const DANGER_SECONDS = 60;
   const CRITICAL_SECONDS = 30;
   const CHAIN_CLOCK_SAFETY_SECONDS = 3;
+  const TORN_CLOCK_SYNC_INTERVAL_MS = 60000;
   const DEFAULT_WAIT_WARNING_SECONDS = 240;
   const DEFAULT_TEMPLATE =
     'HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})';
@@ -165,6 +166,10 @@
   let upSince = Date.now();
   let dangerAlertedForHit = null;
   let criticalAlertedForHit = null;
+  let tornClockOffsetMs = 0;
+  let tornClockSyncedAt = 0;
+  let tornClockSyncInFlight = false;
+  let chainDeadlineTornMs = 0;
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
@@ -296,12 +301,48 @@
     return `${mins}:${String(secs).padStart(2, '0')}`;
   }
 
+  function tornNowMs() {
+    return Date.now() + tornClockOffsetMs;
+  }
+
+  function toEpochMs(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return number < 1e12 ? number * 1000 : number;
+  }
+
+  function updateChainDeadline(chain, requestStartedAt, requestFinishedAt) {
+    const timeout = Number(chain?.timeout);
+    if (!Number.isFinite(timeout) || timeout <= 0 || !tornClockSyncedAt) {
+      chainDeadlineTornMs = 0;
+      return;
+    }
+
+    const startedAt = Number(requestStartedAt) || Date.now();
+    const finishedAt = Number(requestFinishedAt) || startedAt;
+    const midpointTornMs = ((startedAt + finishedAt) / 2) + tornClockOffsetMs;
+    const apiEndMs = toEpochMs(chain?.end);
+
+    if (apiEndMs > midpointTornMs && apiEndMs - midpointTornMs <= 360000) {
+      chainDeadlineTornMs = apiEndMs;
+      return;
+    }
+
+    chainDeadlineTornMs = midpointTornMs + (timeout * 1000);
+  }
+
   function remainingChainSeconds() {
     const current = Number(state.api.chainCurrent);
     const timeout = Number(state.api.chainTimeout);
     if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {
       return null;
     }
+
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const calibrated = Math.floor((chainDeadlineTornMs - tornNowMs()) / 1000);
+      return Math.max(0, calibrated - CHAIN_CLOCK_SAFETY_SECONDS);
+    }
+
     const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
     const elapsed = Math.floor((Date.now() - observedAt) / 1000);
     return Math.max(0, timeout - elapsed - CHAIN_CLOCK_SAFETY_SECONDS);
@@ -846,6 +887,34 @@
     throw lastError;
   }
 
+  async function syncTornClock({ force = false } = {}) {
+    if (!hasApiKey() || tornClockSyncInFlight) return false;
+    const now = Date.now();
+    if (!force && tornClockSyncedAt && now - tornClockSyncedAt < TORN_CLOCK_SYNC_INTERVAL_MS) return true;
+
+    tornClockSyncInFlight = true;
+    const sentAt = Date.now();
+    try {
+      const data = await requestOnce('/faction/timestamp');
+      const receivedAt = Date.now();
+      const raw = data?.timestamp ?? data?.time ?? data?.server_time ?? data;
+      const value = typeof raw === 'object'
+        ? (raw?.timestamp ?? raw?.time ?? raw?.server_time)
+        : raw;
+      let serverMs = Number(value);
+      if (!Number.isFinite(serverMs) || serverMs <= 0) throw new Error('Invalid Torn server timestamp.');
+      if (serverMs < 1e12) serverMs *= 1000;
+      tornClockOffsetMs = serverMs - ((sentAt + receivedAt) / 2);
+      tornClockSyncedAt = receivedAt;
+      return true;
+    } catch (error) {
+      console.warn('[Merc-C-Que] Torn clock calibration failed; using local fallback:', error);
+      return false;
+    } finally {
+      tornClockSyncInFlight = false;
+    }
+  }
+
   const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);
   const fetchAttacks = (key = '') => apiRequest('/faction/attacks', {
     filters: 'outgoing', limit: '100', sort: 'DESC'
@@ -950,6 +1019,10 @@
     state.api.lastHit = {
       attacker, chain, ended: Number(attack.ended) || 0, result: attack.result || ''
     };
+    const attackEndedMs = toEpochMs(attack.ended);
+    if (chain >= 10 && tornClockSyncedAt && attackEndedMs > 0) {
+      chainDeadlineTornMs = attackEndedMs + 300000;
+    }
     const event = {
       id, attacker, chain, ended: Number(attack.ended) || 0,
       result: attack.result || '', kind, expectedPlayer: current || '—'
@@ -1055,9 +1128,12 @@
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
 
+    const requestStartedAt = Date.now();
+    let requestFinishedAt = requestStartedAt;
     let data;
     try {
       data = await fetchChain();
+      requestFinishedAt = Date.now();
     } catch (error) {
       handleApiError(error);
       chainInFlight = false;
@@ -1090,6 +1166,7 @@
         state.api.chainMax = Number(chain.max) || 0;
         state.api.chainTimeout = Number(chain.timeout);
         state.api.chainTimeoutObservedAt = Date.now();
+        updateChainDeadline(chain, requestStartedAt, requestFinishedAt);
         state.manualNextHit = acceptedCurrent + 1;
         if (newChain && state.api.baselineReady) {
           setTimeout(() => pollAttacks({ forceBaseline: false, reconciliation: true }), 50);
@@ -1100,6 +1177,7 @@
         state.api.chainMax = null;
         state.api.chainTimeout = null;
         state.api.chainTimeoutObservedAt = 0;
+        chainDeadlineTornMs = 0;
       }
 
       if (reconciliation) {
@@ -1124,6 +1202,7 @@
     state.api.status = `Rechecking Torn after ${reason}…`;
     refresh();
     try {
+      await syncTornClock({ force: true });
       await pollChain({ reconciliation: true });
       await pollAttacks({ forceBaseline: false, reconciliation: true });
       state.api.reconciliationNote = state.api.reconciliationNote || 'Resume reconciliation complete.';
@@ -1196,7 +1275,7 @@
     refresh();
     toast('API settings saved.');
     if (automationActive()) {
-      pollChain();
+      syncTornClock().finally(() => pollChain());
       pollAttacks({ forceBaseline: !state.api.baselineReady });
     }
   }
@@ -1317,11 +1396,17 @@
     }
     if (!automationActive() || inBackoff()) return;
     const now = Date.now();
+    if (!tornClockSyncedAt || now - tornClockSyncedAt >= TORN_CLOCK_SYNC_INTERVAL_MS) syncTornClock();
     if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
     if (now - Number(state.api.lastChainPoll || 0) >= desiredPollSeconds(state.api.chainPollSeconds) * 1000) pollChain();
   }
 
   function schedulerDelay() {
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const remainingMs = chainDeadlineTornMs - tornNowMs();
+      const untilBoundary = ((remainingMs % 1000) + 1000) % 1000;
+      return Math.max(100, untilBoundary + 15);
+    }
     const now = Date.now();
     const observedAt = Number(state.api.chainTimeoutObservedAt) || 0;
     const phase = observedAt > 0 ? Math.max(0, now - observedAt) % 1000 : now % 1000;
@@ -2129,6 +2214,6 @@
   if (automationActive()) {
     resetPollTimers();
     if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });
-    pollChain();
+    syncTornClock({ force: true }).finally(() => pollChain());
   }
 })();
