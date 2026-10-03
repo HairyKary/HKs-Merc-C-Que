@@ -1,0 +1,202 @@
+name: Apply v2.5.11 Torn clock calibration
+
+on:
+  push:
+    branches:
+      - v2.5.11-clock-safety
+    paths:
+      - .github/workflows/apply-v2.5.11-torn-clock.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.11-clock-safety
+
+      - name: Apply Torn clock calibration and verify
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('HKs-Merc-C-Que.user.js')
+          text = path.read_text(encoding='utf-8')
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "  const CHAIN_CLOCK_SAFETY_SECONDS = 3;\n  const DEFAULT_WAIT_WARNING_SECONDS = 240;",
+              "  const CHAIN_CLOCK_SAFETY_SECONDS = 3;\n  const TORN_CLOCK_SYNC_INTERVAL_MS = 60000;\n  const DEFAULT_WAIT_WARNING_SECONDS = 240;",
+              'clock sync interval constant'
+          )
+
+          replace_once(
+              "  let dangerAlertedForHit = null;\n  let criticalAlertedForHit = null;",
+              "  let dangerAlertedForHit = null;\n  let criticalAlertedForHit = null;\n  let tornClockOffsetMs = 0;\n  let tornClockSyncedAt = 0;\n  let tornClockSyncInFlight = false;\n  let chainDeadlineTornMs = 0;",
+              'clock runtime state'
+          )
+
+          old_remaining = '''  function remainingChainSeconds() {
+    const current = Number(state.api.chainCurrent);
+    const timeout = Number(state.api.chainTimeout);
+    if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {
+      return null;
+    }
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+    return Math.max(0, timeout - elapsed - CHAIN_CLOCK_SAFETY_SECONDS);
+  }
+'''
+          new_remaining = '''  function tornNowMs() {
+    return Date.now() + tornClockOffsetMs;
+  }
+
+  function toEpochMs(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return number < 1e12 ? number * 1000 : number;
+  }
+
+  function updateChainDeadline(chain, requestStartedAt, requestFinishedAt) {
+    const timeout = Number(chain?.timeout);
+    if (!Number.isFinite(timeout) || timeout <= 0 || !tornClockSyncedAt) {
+      chainDeadlineTornMs = 0;
+      return;
+    }
+
+    const startedAt = Number(requestStartedAt) || Date.now();
+    const finishedAt = Number(requestFinishedAt) || startedAt;
+    const midpointTornMs = ((startedAt + finishedAt) / 2) + tornClockOffsetMs;
+    const apiEndMs = toEpochMs(chain?.end);
+
+    // Prefer Torn's absolute end time when it is a plausible active-chain deadline.
+    if (apiEndMs > midpointTornMs && apiEndMs - midpointTornMs <= 360000) {
+      chainDeadlineTornMs = apiEndMs;
+      return;
+    }
+
+    // Otherwise compensate for request travel time by anchoring timeout at the request midpoint.
+    chainDeadlineTornMs = midpointTornMs + (timeout * 1000);
+  }
+
+  function remainingChainSeconds() {
+    const current = Number(state.api.chainCurrent);
+    const timeout = Number(state.api.chainTimeout);
+    if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {
+      return null;
+    }
+
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const calibrated = Math.floor((chainDeadlineTornMs - tornNowMs()) / 1000);
+      return Math.max(0, calibrated - CHAIN_CLOCK_SAFETY_SECONDS);
+    }
+
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
+    const elapsed = Math.floor((Date.now() - observedAt) / 1000);
+    return Math.max(0, timeout - elapsed - CHAIN_CLOCK_SAFETY_SECONDS);
+  }
+'''
+          replace_once(old_remaining, new_remaining, 'calibrated remaining chain time')
+
+          replace_once(
+              "  const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);\n  const fetchAttacks = (key = '') => apiRequest('/faction/attacks', {",
+              "  async function syncTornClock({ force = false } = {}) {\n    if (!hasApiKey() || tornClockSyncInFlight) return false;\n    const now = Date.now();\n    if (!force && tornClockSyncedAt && now - tornClockSyncedAt < TORN_CLOCK_SYNC_INTERVAL_MS) return true;\n\n    tornClockSyncInFlight = true;\n    const sentAt = Date.now();\n    try {\n      const data = await requestOnce('/faction/timestamp');\n      const receivedAt = Date.now();\n      const raw = data?.timestamp ?? data?.time ?? data?.server_time ?? data;\n      const value = typeof raw === 'object'\n        ? (raw?.timestamp ?? raw?.time ?? raw?.server_time)\n        : raw;\n      let serverMs = Number(value);\n      if (!Number.isFinite(serverMs) || serverMs <= 0) throw new Error('Invalid Torn server timestamp.');\n      if (serverMs < 1e12) serverMs *= 1000;\n      tornClockOffsetMs = serverMs - ((sentAt + receivedAt) / 2);\n      tornClockSyncedAt = receivedAt;\n      return true;\n    } catch (error) {\n      console.warn('[Merc-C-Que] Torn clock calibration failed; using local fallback:', error);\n      return false;\n    } finally {\n      tornClockSyncInFlight = false;\n    }\n  }\n\n  const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);\n  const fetchAttacks = (key = '') => apiRequest('/faction/attacks', {",
+              'Torn clock sync function'
+          )
+
+          replace_once(
+              "    state.api.lastHit = {\n      attacker, chain, ended: Number(attack.ended) || 0, result: attack.result || ''\n    };",
+              "    state.api.lastHit = {\n      attacker, chain, ended: Number(attack.ended) || 0, result: attack.result || ''\n    };\n    const attackEndedMs = toEpochMs(attack.ended);\n    if (chain >= 10 && tornClockSyncedAt && attackEndedMs > 0) {\n      chainDeadlineTornMs = attackEndedMs + 300000;\n    }",
+              'attack-derived deadline refresh'
+          )
+
+          replace_once(
+              "    chainInFlight = true;\n    state.api.lastChainPoll = Date.now();\n\n    let data;\n    try {\n      data = await fetchChain();",
+              "    chainInFlight = true;\n    state.api.lastChainPoll = Date.now();\n\n    const requestStartedAt = Date.now();\n    let requestFinishedAt = requestStartedAt;\n    let data;\n    try {\n      data = await fetchChain();\n      requestFinishedAt = Date.now();",
+              'chain request timing'
+          )
+
+          replace_once(
+              "        state.api.chainTimeout = Number(chain.timeout);\n        state.api.chainTimeoutObservedAt = Date.now();\n        state.manualNextHit = acceptedCurrent + 1;",
+              "        state.api.chainTimeout = Number(chain.timeout);\n        state.api.chainTimeoutObservedAt = Date.now();\n        updateChainDeadline(chain, requestStartedAt, requestFinishedAt);\n        state.manualNextHit = acceptedCurrent + 1;",
+              'chain deadline update'
+          )
+
+          replace_once(
+              "        state.api.chainTimeout = null;\n        state.api.chainTimeoutObservedAt = 0;",
+              "        state.api.chainTimeout = null;\n        state.api.chainTimeoutObservedAt = 0;\n        chainDeadlineTornMs = 0;",
+              'clear chain deadline'
+          )
+
+          replace_once(
+              "    try {\n      await pollChain({ reconciliation: true });\n      await pollAttacks({ forceBaseline: false, reconciliation: true });",
+              "    try {\n      await syncTornClock({ force: true });\n      await pollChain({ reconciliation: true });\n      await pollAttacks({ forceBaseline: false, reconciliation: true });",
+              'resume clock resync'
+          )
+
+          replace_once(
+              "    if (automationActive()) {\n      pollChain();\n      pollAttacks({ forceBaseline: !state.api.baselineReady });\n    }",
+              "    if (automationActive()) {\n      syncTornClock().finally(() => pollChain());\n      pollAttacks({ forceBaseline: !state.api.baselineReady });\n    }",
+              'settings clock startup'
+          )
+
+          replace_once(
+              "    const now = Date.now();\n    if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();",
+              "    const now = Date.now();\n    if (!tornClockSyncedAt || now - tornClockSyncedAt >= TORN_CLOCK_SYNC_INTERVAL_MS) syncTornClock();\n    if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();",
+              'periodic clock calibration'
+          )
+
+          old_scheduler_delay = '''  function schedulerDelay() {
+    const now = Date.now();
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || 0;
+    const phase = observedAt > 0 ? Math.max(0, now - observedAt) % 1000 : now % 1000;
+    return Math.max(100, 1000 - phase + 15);
+  }
+'''
+          new_scheduler_delay = '''  function schedulerDelay() {
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const remainingMs = chainDeadlineTornMs - tornNowMs();
+      const untilBoundary = ((remainingMs % 1000) + 1000) % 1000;
+      return Math.max(100, untilBoundary + 15);
+    }
+    const now = Date.now();
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || 0;
+    const phase = observedAt > 0 ? Math.max(0, now - observedAt) % 1000 : now % 1000;
+    return Math.max(100, 1000 - phase + 15);
+  }
+'''
+          replace_once(old_scheduler_delay, new_scheduler_delay, 'calibrated scheduler boundary')
+
+          replace_once(
+              "  if (automationActive()) {\n    resetPollTimers();\n    if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });\n    pollChain();\n  }",
+              "  if (automationActive()) {\n    resetPollTimers();\n    if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });\n    syncTornClock({ force: true }).finally(() => pollChain());\n  }",
+              'startup clock calibration'
+          )
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          node --check HKs-Merc-C-Que.user.js
+          grep -q "TORN_CLOCK_SYNC_INTERVAL_MS = 60000" HKs-Merc-C-Que.user.js
+          grep -q "requestOnce('/faction/timestamp')" HKs-Merc-C-Que.user.js
+          grep -q "chainDeadlineTornMs" HKs-Merc-C-Que.user.js
+          grep -q "attackEndedMs + 300000" HKs-Merc-C-Que.user.js
+          grep -q "CHAIN_CLOCK_SAFETY_SECONDS = 3" HKs-Merc-C-Que.user.js
+          grep -q "current < 10" HKs-Merc-C-Que.user.js
+
+      - name: Commit Torn clock calibration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HKs-Merc-C-Que.user.js
+          git commit -m "Calibrate chain clock to Torn server time"
+          git push origin HEAD:v2.5.11-clock-safety
