@@ -507,6 +507,9 @@
       api.attackPollSeconds,
       api.chainPollSeconds,
       api.paused ? 1 : 0,
+      api.lastError || '',
+      api.backoffUntil || 0,
+      api.reconciliationNote || '',
       ui.soundAlerts ? 1 : 0,
       ui.waitWarning ? 1 : 0,
       ui.waitWarningSeconds
