@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Release  
-> **Current version:** v2.5.10  
+> **Current version:** v2.5.11  
 > Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
@@ -41,6 +41,10 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Adaptive polling with retry/backoff and resume reconciliation
 - Reduced storage writes during unchanged API polls
 - Chain danger/critical countdown alerts with optional sound
+- Torn-calibrated chain countdown with a conservative 3-second safety buffer
+- Broken or expired chains reset Auto/Assisted hit numbering back to HIT #1
+- Torn PDA minimized launcher can be temporarily hidden for the current session
+- Smoother drag handling and lighter minimized-launcher updates
 - Optional warning when the same player remains UP too long
 
 ## Installation
@@ -77,6 +81,8 @@ Click the **—** button in the Merc-C-Que header to minimize the panel.
 
 Merc-C-Que becomes a small draggable launcher showing the current queued player, assigned hit number, and chain clock when available. Its position is remembered. Click the launcher to restore the full panel.
 
+On Torn PDA, the minimized launcher also includes a small **×** that hides Merc-C-Que for the current PDA/webview session without deleting queue, API, or saved UI data.
+
 The launcher status dot indicates whether API automation is active, paused, or waiting for attention. Pending Assisted / out-of-order / unqueued hits also show a badge count.
 
 ## API Modes
@@ -111,6 +117,9 @@ Merc-C-Que includes:
 - Processed-attack tracking to avoid duplicate queue advancement
 - Separate handling for API/network errors vs internal processing errors
 - Change-aware chain polling so unchanged polls avoid unnecessary state serialization/storage writes
+- Torn server-time calibration for the live chain clock, with local fallback if calibration is unavailable
+- Conservative 3-second chain-clock safety margin
+- Automatic reset to HIT #1 when Torn reports no active chain
 
 ## Undo Behavior
 

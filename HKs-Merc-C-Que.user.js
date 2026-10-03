@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.10
+// @version      2.5.11
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.10';
+  const VERSION = '2.5.11';
   const SCHEMA_VERSION = 5;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -38,12 +38,15 @@
   const PDA_MINIMIZED_STORE = 'ui_minimized';
   const PDA_LAUNCHER_POSITION_STORE = 'ui_launcher_position';
   const PDA_PANEL_POSITION_STORE = 'ui_panel_position';
+  const PDA_SESSION_DISMISS_STORE = 'hkmcq_pda_launcher_dismissed';
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
   const MAX_PENDING = 50;
   const MAX_LEDGER = 200;
   const DANGER_SECONDS = 60;
   const CRITICAL_SECONDS = 30;
+  const CHAIN_CLOCK_SAFETY_SECONDS = 3;
+  const TORN_CLOCK_SYNC_INTERVAL_MS = 60000;
   const DEFAULT_WAIT_WARNING_SECONDS = 240;
   const DEFAULT_TEMPLATE =
     'HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})';
@@ -121,6 +124,20 @@
 
   const IS_PDA = !!(PDA_HTTP_GET || PDA_STORAGE || PDA_INJECTED_KEY);
 
+  function readPdaDismissedForSession() {
+    if (!IS_PDA) return false;
+    try { return sessionStorage.getItem(PDA_SESSION_DISMISS_STORE) === '1'; }
+    catch { return false; }
+  }
+
+  function writePdaDismissedForSession(dismissed) {
+    if (!IS_PDA) return;
+    try {
+      if (dismissed) sessionStorage.setItem(PDA_SESSION_DISMISS_STORE, '1');
+      else sessionStorage.removeItem(PDA_SESSION_DISMISS_STORE);
+    } catch {}
+  }
+
   let state = loadState();
   if (PDA_STORAGE) {
     const savedPdaUi = await loadPdaUiState();
@@ -141,11 +158,18 @@
   let launcherDrag = null;
   let rosterDrag = null;
   let suppressLauncherClickUntil = 0;
+  let launcherDismissedForSession = readPdaDismissedForSession();
+  let pointerMoveFrame = 0;
+  let pendingPointerMove = null;
   let lastVisibilityChangeAt = Date.now();
   let lastUpName = '';
   let upSince = Date.now();
   let dangerAlertedForHit = null;
   let criticalAlertedForHit = null;
+  let tornClockOffsetMs = 0;
+  let tornClockSyncedAt = 0;
+  let tornClockSyncInFlight = false;
+  let chainDeadlineTornMs = 0;
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
@@ -277,15 +301,51 @@
     return `${mins}:${String(secs).padStart(2, '0')}`;
   }
 
+  function tornNowMs() {
+    return Date.now() + tornClockOffsetMs;
+  }
+
+  function toEpochMs(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return number < 1e12 ? number * 1000 : number;
+  }
+
+  function updateChainDeadline(chain, requestStartedAt, requestFinishedAt) {
+    const timeout = Number(chain?.timeout);
+    if (!Number.isFinite(timeout) || timeout <= 0 || !tornClockSyncedAt) {
+      chainDeadlineTornMs = 0;
+      return;
+    }
+
+    const startedAt = Number(requestStartedAt) || Date.now();
+    const finishedAt = Number(requestFinishedAt) || startedAt;
+    const midpointTornMs = ((startedAt + finishedAt) / 2) + tornClockOffsetMs;
+    const apiEndMs = toEpochMs(chain?.end);
+
+    if (apiEndMs > midpointTornMs && apiEndMs - midpointTornMs <= 360000) {
+      chainDeadlineTornMs = apiEndMs;
+      return;
+    }
+
+    chainDeadlineTornMs = midpointTornMs + (timeout * 1000);
+  }
+
   function remainingChainSeconds() {
     const current = Number(state.api.chainCurrent);
     const timeout = Number(state.api.chainTimeout);
     if (!Number.isFinite(current) || current < 10 || !Number.isFinite(timeout) || timeout <= 0) {
       return null;
     }
+
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const calibrated = Math.floor((chainDeadlineTornMs - tornNowMs()) / 1000);
+      return Math.max(0, calibrated - CHAIN_CLOCK_SAFETY_SECONDS);
+    }
+
     const observedAt = Number(state.api.chainTimeoutObservedAt) || Date.now();
     const elapsed = Math.floor((Date.now() - observedAt) / 1000);
-    return Math.max(0, timeout - elapsed);
+    return Math.max(0, timeout - elapsed - CHAIN_CLOCK_SAFETY_SECONDS);
   }
 
   function isTransientError(error) {
@@ -827,6 +887,34 @@
     throw lastError;
   }
 
+  async function syncTornClock({ force = false } = {}) {
+    if (!hasApiKey() || tornClockSyncInFlight) return false;
+    const now = Date.now();
+    if (!force && tornClockSyncedAt && now - tornClockSyncedAt < TORN_CLOCK_SYNC_INTERVAL_MS) return true;
+
+    tornClockSyncInFlight = true;
+    const sentAt = Date.now();
+    try {
+      const data = await requestOnce('/faction/timestamp');
+      const receivedAt = Date.now();
+      const raw = data?.timestamp ?? data?.time ?? data?.server_time ?? data;
+      const value = typeof raw === 'object'
+        ? (raw?.timestamp ?? raw?.time ?? raw?.server_time)
+        : raw;
+      let serverMs = Number(value);
+      if (!Number.isFinite(serverMs) || serverMs <= 0) throw new Error('Invalid Torn server timestamp.');
+      if (serverMs < 1e12) serverMs *= 1000;
+      tornClockOffsetMs = serverMs - ((sentAt + receivedAt) / 2);
+      tornClockSyncedAt = receivedAt;
+      return true;
+    } catch (error) {
+      console.warn('[Merc-C-Que] Torn clock calibration failed; using local fallback:', error);
+      return false;
+    } finally {
+      tornClockSyncInFlight = false;
+    }
+  }
+
   const fetchChain = (key = '') => apiRequest('/faction/chain', {}, key);
   const fetchAttacks = (key = '') => apiRequest('/faction/attacks', {
     filters: 'outgoing', limit: '100', sort: 'DESC'
@@ -931,6 +1019,10 @@
     state.api.lastHit = {
       attacker, chain, ended: Number(attack.ended) || 0, result: attack.result || ''
     };
+    const attackEndedMs = toEpochMs(attack.ended);
+    if (chain >= 10 && tornClockSyncedAt && attackEndedMs > 0) {
+      chainDeadlineTornMs = attackEndedMs + 300000;
+    }
     const event = {
       id, attacker, chain, ended: Number(attack.ended) || 0,
       result: attack.result || '', kind, expectedPlayer: current || '—'
@@ -1036,9 +1128,12 @@
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
 
+    const requestStartedAt = Date.now();
+    let requestFinishedAt = requestStartedAt;
     let data;
     try {
       data = await fetchChain();
+      requestFinishedAt = Date.now();
     } catch (error) {
       handleApiError(error);
       chainInFlight = false;
@@ -1049,11 +1144,14 @@
       const before = chainSnapshot();
       const hadSyncError = hasSyncError();
       const chain = data?.chain || null;
+      const chainCurrentValue = Number(chain?.current) || 0;
+      const chainTimeoutValue = Number(chain?.timeout) || 0;
+      const activeChain = !!chain && chainCurrentValue > 0 && chainTimeoutValue > 0;
 
-      if (chain) {
+      if (activeChain) {
         const previousId = state.api.chainId;
         const previousCurrent = Number(state.api.chainCurrent);
-        const newCurrent = Number(chain.current) || 0;
+        const newCurrent = chainCurrentValue;
         const newId = chain.id ?? null;
         const newChain = previousId != null && newId != null && String(previousId) !== String(newId);
         if (newChain) {
@@ -1064,13 +1162,15 @@
           criticalAlertedForHit = null;
         }
         const sameChain = previousId != null && newId != null && String(previousId) === String(newId);
-        const acceptedCurrent = sameChain && Number.isFinite(previousCurrent) && newCurrent < previousCurrent
+        const acceptedCurrent = sameChain && Number.isFinite(previousCurrent)
+          && previousCurrent >= 10 && newCurrent >= 10 && newCurrent < previousCurrent
           ? previousCurrent : newCurrent;
         state.api.chainId = newId;
         state.api.chainCurrent = acceptedCurrent;
         state.api.chainMax = Number(chain.max) || 0;
-        state.api.chainTimeout = Number(chain.timeout);
+        state.api.chainTimeout = chainTimeoutValue;
         state.api.chainTimeoutObservedAt = Date.now();
+        updateChainDeadline(chain, requestStartedAt, requestFinishedAt);
         state.manualNextHit = acceptedCurrent + 1;
         if (newChain && state.api.baselineReady) {
           setTimeout(() => pollAttacks({ forceBaseline: false, reconciliation: true }), 50);
@@ -1081,6 +1181,10 @@
         state.api.chainMax = null;
         state.api.chainTimeout = null;
         state.api.chainTimeoutObservedAt = 0;
+        state.manualNextHit = 1;
+        chainDeadlineTornMs = 0;
+        dangerAlertedForHit = null;
+        criticalAlertedForHit = null;
       }
 
       if (reconciliation) {
@@ -1105,6 +1209,7 @@
     state.api.status = `Rechecking Torn after ${reason}…`;
     refresh();
     try {
+      await syncTornClock({ force: true });
       await pollChain({ reconciliation: true });
       await pollAttacks({ forceBaseline: false, reconciliation: true });
       state.api.reconciliationNote = state.api.reconciliationNote || 'Resume reconciliation complete.';
@@ -1177,7 +1282,7 @@
     refresh();
     toast('API settings saved.');
     if (automationActive()) {
-      pollChain();
+      syncTornClock().finally(() => pollChain());
       pollAttacks({ forceBaseline: !state.api.baselineReady });
     }
   }
@@ -1292,12 +1397,35 @@
   function schedulerTick() {
     trackUpTimer();
     runDangerAlerts();
-    if (state.minimized) refreshLauncher();
-    else refreshLiveIndicators();
+    if (!(IS_PDA && launcherDismissedForSession)) {
+      if (state.minimized) refreshLauncher();
+      else refreshLiveIndicators();
+    }
     if (!automationActive() || inBackoff()) return;
     const now = Date.now();
+    if (!tornClockSyncedAt || now - tornClockSyncedAt >= TORN_CLOCK_SYNC_INTERVAL_MS) syncTornClock();
     if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
     if (now - Number(state.api.lastChainPoll || 0) >= desiredPollSeconds(state.api.chainPollSeconds) * 1000) pollChain();
+  }
+
+  function schedulerDelay() {
+    if (tornClockSyncedAt && chainDeadlineTornMs > 0) {
+      const remainingMs = chainDeadlineTornMs - tornNowMs();
+      const untilBoundary = ((remainingMs % 1000) + 1000) % 1000;
+      return Math.max(100, untilBoundary + 15);
+    }
+    const now = Date.now();
+    const observedAt = Number(state.api.chainTimeoutObservedAt) || 0;
+    const phase = observedAt > 0 ? Math.max(0, now - observedAt) % 1000 : now % 1000;
+    return Math.max(100, 1000 - phase + 15);
+  }
+
+  function startScheduler() {
+    const run = () => {
+      schedulerTick();
+      setTimeout(run, schedulerDelay());
+    };
+    setTimeout(run, schedulerDelay());
   }
 
   function detectDarkTheme() {
@@ -1355,6 +1483,8 @@
       #${LAUNCHER_ID}{position:fixed;z-index:1000000;min-width:112px;min-height:42px;padding:0 11px;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid ${colors.border};border-radius:8px;background:${colors.panel2};color:${colors.text};box-shadow:0 6px 18px rgba(0,0,0,.35);font:800 11px Arial,Helvetica,sans-serif;cursor:grab;user-select:none;touch-action:none}
       #${LAUNCHER_ID}.danger{background:${colors.warn}} #${LAUNCHER_ID}.critical{background:${colors.danger};animation:hkmcqPulse 1s infinite} #${LAUNCHER_ID} .launcherDot{width:8px;height:8px;border-radius:50%;background:#777;flex:0 0 auto} #${LAUNCHER_ID}.active .launcherDot{background:#5ca85c} #${LAUNCHER_ID}.paused .launcherDot{background:#c9902f} #${LAUNCHER_ID}.pending .launcherDot{background:#c45b5b}
       #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}
+      #${LAUNCHER_ID} .launcherClose{width:26px;height:26px;margin-left:2px;display:grid;place-items:center;border-radius:5px;font-size:17px;line-height:1;font-weight:800;opacity:.72;cursor:pointer}
+      #${LAUNCHER_ID} .launcherClose:hover{background:rgba(127,127,127,.18);opacity:1}
       #${TOAST_ID}{position:fixed;right:20px;bottom:22px;z-index:1000001;background:rgba(20,20,20,.95);color:#fff;border-radius:7px;padding:9px 12px;font:13px Arial,Helvetica,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}
       @media(max-width:600px){#${PANEL_ID}{width:calc(100vw - 8px);left:4px!important;right:auto!important;top:58px;border-radius:8px;font-size:14px}#${PANEL_ID} button{min-height:40px}#${PANEL_ID} .icon,#${PANEL_ID} .remove,#${PANEL_ID} .handle{width:40px;height:40px}#${PANEL_ID} .row{grid-template-columns:40px minmax(0,1fr) 42px 62px 40px}#${PANEL_ID} .roster{max-height:36vh}#${PANEL_ID} .controls{grid-template-columns:1.45fr 1fr 1fr}#${PANEL_ID} .upName{font-size:23px}#${LAUNCHER_ID}{min-height:46px;min-width:126px}}
     `;
@@ -1408,6 +1538,14 @@
     state.minimized = false;
     saveNow();
     renderApp();
+  }
+
+  function dismissLauncherForSession() {
+    if (!IS_PDA) return;
+    launcherDismissedForSession = true;
+    writePdaDismissedForSession(true);
+    launcherDrag = null;
+    document.getElementById(LAUNCHER_ID)?.remove();
   }
 
   function rosterRowsHtml() {
@@ -1615,7 +1753,7 @@
   }
 
   function refresh(options = {}) {
-    if (state.minimized) return renderLauncher();
+    if (state.minimized) return refreshLauncher();
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return renderPanel();
     const ready = readyParticipants();
@@ -1710,6 +1848,10 @@
 
   function renderLauncher() {
     document.getElementById(PANEL_ID)?.remove();
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     let launcher = document.getElementById(LAUNCHER_ID);
     if (!launcher) {
       launcher = document.createElement('button');
@@ -1722,6 +1864,7 @@
     const label = launcherLabel();
     launcher.innerHTML = `
       <span class="launcherDot"></span><span id="hkmcq-launcher-label">${escapeHtml(label)}</span>
+      ${IS_PDA ? '<span class="launcherClose" data-launcher-close="1" role="button" aria-label="Hide Merc-C-Que for this session" title="Hide Merc-C-Que for this session">×</span>' : ''}
       ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
     launcher.title = `Merc-C-Que — ${label} — ${state.api.status || state.api.mode}`;
     const saved = state.launcherPosition;
@@ -1733,12 +1876,32 @@
   }
 
   function refreshLauncher() {
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     const launcher = document.getElementById(LAUNCHER_ID);
     if (!launcher) return renderLauncher();
     launcher.className = launcherStateClasses();
     const text = launcherLabel();
     const label = launcher.querySelector('#hkmcq-launcher-label');
-    if (label) label.textContent = text;
+    if (label && label.textContent !== text) label.textContent = text;
+
+    const pendingCount = state.api.pendingHits.length;
+    let badge = launcher.querySelector('.launcherBadge');
+    if (pendingCount > 0) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'launcherBadge';
+        launcher.appendChild(badge);
+      }
+      const badgeText = pendingCount > 99 ? '99+' : String(pendingCount);
+      if (badge.textContent !== badgeText) badge.textContent = badgeText;
+      badge.title = `${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention`;
+    } else if (badge) {
+      badge.remove();
+    }
+
     launcher.title = `Merc-C-Que — ${text} — ${state.api.status || state.api.mode}`;
   }
 
@@ -1860,6 +2023,7 @@
     if (launcher.dataset.hkmcqBound === '1') return;
     launcher.dataset.hkmcqBound = '1';
     launcher.addEventListener('pointerdown', event => {
+      if (event.target.closest?.('[data-launcher-close="1"]')) return;
       if (event.button != null && event.button !== 0) return;
       const rect = launcher.getBoundingClientRect();
       launcherDrag = {
@@ -1875,6 +2039,11 @@
     });
     launcher.addEventListener('click', event => {
       event.preventDefault();
+      if (event.target.closest?.('[data-launcher-close="1"]')) {
+        event.stopPropagation();
+        dismissLauncherForSession();
+        return;
+      }
       if (Date.now() < suppressLauncherClickUntil) return;
       restoreApp();
     });
@@ -1884,33 +2053,58 @@
     document.querySelectorAll(`#${PANEL_ID} .row.dragging, #${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragging', 'dragover'));
   }
 
-  document.addEventListener('pointermove', event => {
-    if (panelDrag && event.pointerId === panelDrag.pointerId) {
+  function applyPointerMove(point) {
+    if (!point) return;
+    const { pointerId, clientX, clientY } = point;
+    if (panelDrag && pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        setPosition(panel, clampPanelPosition(event.clientX - panelDrag.offsetX, event.clientY - panelDrag.offsetY, panel));
+        setPosition(panel, clampPanelPosition(clientX - panelDrag.offsetX, clientY - panelDrag.offsetY, panel));
         panel.style.right = 'auto';
         adjustPanelViewport();
       }
     }
-    if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
+    if (launcherDrag && pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
-        if (Math.abs(event.clientX - launcherDrag.startX) > 3 || Math.abs(event.clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
-        setPosition(launcher, clampLauncherPosition(event.clientX - launcherDrag.offsetX, event.clientY - launcherDrag.offsetY, launcher));
+        if (Math.abs(clientX - launcherDrag.startX) > 3 || Math.abs(clientY - launcherDrag.startY) > 3) launcherDrag.moved = true;
+        setPosition(launcher, clampLauncherPosition(clientX - launcherDrag.offsetX, clientY - launcherDrag.offsetY, launcher));
       }
     }
-    if (rosterDrag && event.pointerId === rosterDrag.pointerId) {
-      const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(`#${PANEL_ID} .row`);
+    if (rosterDrag && pointerId === rosterDrag.pointerId) {
+      const target = document.elementFromPoint(clientX, clientY)?.closest(`#${PANEL_ID} .row`);
       document.querySelectorAll(`#${PANEL_ID} .row.dragover`).forEach(element => element.classList.remove('dragover'));
       if (target) {
         target.classList.add('dragover');
         rosterDrag.targetIndex = Number(target.dataset.index);
       }
     }
+  }
+
+  function flushPointerMove() {
+    pointerMoveFrame = 0;
+    const point = pendingPointerMove;
+    pendingPointerMove = null;
+    applyPointerMove(point);
+  }
+
+  function flushPendingPointerMove() {
+    if (!pendingPointerMove) return;
+    if (pointerMoveFrame) cancelAnimationFrame(pointerMoveFrame);
+    flushPointerMove();
+  }
+
+  document.addEventListener('pointermove', event => {
+    pendingPointerMove = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY
+    };
+    if (!pointerMoveFrame) pointerMoveFrame = requestAnimationFrame(flushPointerMove);
   });
 
   document.addEventListener('pointerup', event => {
+    if (pendingPointerMove?.pointerId === event.pointerId) flushPendingPointerMove();
     if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
@@ -1941,6 +2135,9 @@
   });
 
   document.addEventListener('pointercancel', () => {
+    if (pointerMoveFrame) cancelAnimationFrame(pointerMoveFrame);
+    pointerMoveFrame = 0;
+    pendingPointerMove = null;
     panelDrag = null;
     launcherDrag = null;
     rosterDrag = null;
@@ -1977,6 +2174,11 @@
 
   function ensureMounted() {
     if (!document.body) return;
+    if (IS_PDA && launcherDismissedForSession) {
+      document.getElementById(PANEL_ID)?.remove();
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
     if (state.minimized) {
       if (!document.getElementById(LAUNCHER_ID)) renderLauncher();
       document.getElementById(PANEL_ID)?.remove();
@@ -2014,11 +2216,11 @@
   trackUpTimer();
   renderApp();
   setInterval(ensureMounted, 2500);
-  setInterval(schedulerTick, 1000);
+  startScheduler();
 
   if (automationActive()) {
     resetPollTimers();
     if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });
-    pollChain();
+    syncTornClock({ force: true }).finally(() => pollChain());
   }
 })();
