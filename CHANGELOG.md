@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.5.11] - Release
+
+### Chain clock / safety
+- Added a conservative 3-second safety buffer so Merc-C-Que warns slightly earlier than Torn's displayed chain deadline
+- Calibrated the live countdown against Torn server time and aligned local countdown updates to calibrated second boundaries
+- Added a local fallback path if Torn clock calibration is unavailable
+- Preserved neutral danger/critical alerts during hits 1-9
+
+### Chain reset behavior
+- Fixed Auto/Assisted hit numbering remaining stuck on a previous short or broken chain
+- When Torn reports no active chain, Merc-C-Que now clears stale chain state and returns the next assigned hit to HIT #1
+- Backward-count protection is limited to established 10+ chains so a new warm-up can begin normally
+
+### Torn PDA / UI polish
+- Added a temporary PDA-only × control on the minimized launcher to hide Merc-C-Que for the current session
+- Session-close state survives Torn page navigation within the same PDA/webview session
+- Batched drag movement with requestAnimationFrame for smoother touch/mouse dragging
+- Reduced unnecessary minimized-launcher DOM rebuilding and hidden UI refresh work
+
+### Validation
+- JavaScript syntax/verification checks passed during development
+- Broken-chain reset behavior was confirmed during several live short-chain tests before release
+
 ## [2.5.10] - Release
 
 ### Chain warm-up alerts
