@@ -185,6 +185,7 @@
   let lastPublishedSharedJson = '';
   let lastLeaderRenewAt = 0;
   let wasApiLeader = false;
+  let lastReportedTabRole = '';
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
@@ -614,7 +615,7 @@
     const lease = readApiLeaderLease();
     if (lease?.id === TAB_ID && Number(lease.expiresAt) > now) {
       if (now - lastLeaderRenewAt >= API_LEADER_RENEW_MS) {
-        const renewed = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS };
+        const renewed = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS, visible: !document.hidden };
         try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(renewed)); } catch {}
         lastLeaderRenewAt = now;
       }
@@ -623,11 +624,14 @@
     }
 
     if (lease?.id && Number(lease.expiresAt) > now) {
-      wasApiLeader = false;
-      return false;
+      const visibleCanPreemptHidden = !document.hidden && lease.visible === false;
+      if (!visibleCanPreemptHidden) {
+        wasApiLeader = false;
+        return false;
+      }
     }
 
-    const candidate = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS };
+    const candidate = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS, visible: !document.hidden };
     try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(candidate)); } catch {}
     const confirmed = readApiLeaderLease();
     const won = confirmed?.id === TAB_ID && Number(confirmed.expiresAt) > now;
@@ -1605,6 +1609,11 @@
   function schedulerTick() {
     trackUpTimer();
     const leader = maintainApiLeadership();
+    const role = tabApiRole();
+    if (role !== lastReportedTabRole) {
+      lastReportedTabRole = role;
+      updateApiStatusBox();
+    }
     if (leader) runDangerAlerts();
     if (!(IS_PDA && launcherDismissedForSession)) {
       if (state.minimized) refreshLauncher();
@@ -2409,6 +2418,7 @@
     const now = Date.now();
     const gap = now - lastVisibilityChangeAt;
     lastVisibilityChangeAt = now;
+    if (isApiLeader()) maintainApiLeadership();
     if (document.hidden) persistPdaUiState();
     if (!document.hidden && gap >= 15000) {
       reconcileAfterResume(IS_PDA ? 'Torn PDA resume' : 'tab resume');
