@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: v2.5.12-multitab-sync
-      - name: Apply optimization patch
+      - name: Apply diagnostics refinement
         run: python3 .github/scripts/optimize-v2.5.12.py
       - name: Verify userscript
         run: |
@@ -32,5 +32,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HKs-Merc-C-Que.user.js
-          git commit -m 'Optimize v2.5.12 multi-tab synchronization'
+          git commit -m 'Refine v2.5.12 API diagnostics refresh'
           git push origin v2.5.12-multitab-sync
