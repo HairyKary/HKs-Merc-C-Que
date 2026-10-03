@@ -155,6 +155,7 @@
   let rosterDraft = null;
   let apiKeyDraft = '';
   let saveTimer = null;
+  let saveTimerSync = false;
   let pdaUiSaveChain = Promise.resolve();
   let attackInFlight = false;
   let chainInFlight = false;
@@ -459,18 +460,18 @@
   }
 
   function buildSharedSnapshot() {
-    const api = clone(state.api);
+    const api = { ...state.api };
     delete api.lastAttackPoll;
     delete api.lastChainPoll;
     return {
       schemaVersion: state.schemaVersion,
-      roster: clone(state.roster),
+      roster: state.roster,
       manualNextHit: state.manualNextHit,
       template: state.template,
-      ui: clone(state.ui),
-      ledger: clone(state.ledger),
+      ui: state.ui,
+      ledger: state.ledger,
       api,
-      history: clone(history),
+      history,
       runtime: {
         lastUpName,
         upSince,
@@ -500,6 +501,18 @@
     };
   }
 
+  function apiControlsSignature(api = state.api, ui = state.ui) {
+    return [
+      api.mode,
+      api.attackPollSeconds,
+      api.chainPollSeconds,
+      api.paused ? 1 : 0,
+      ui.soundAlerts ? 1 : 0,
+      ui.waitWarning ? 1 : 0,
+      ui.waitWarningSeconds
+    ].join('|');
+  }
+
   function publishSharedState(force = false) {
     const snapshot = buildSharedSnapshot();
     const snapshotJson = JSON.stringify(snapshot);
@@ -526,8 +539,14 @@
     const shared = envelope.snapshot;
     if (!shared || typeof shared !== 'object') return false;
 
+    const rosterBefore = JSON.stringify(state.roster);
+    const templateBefore = state.template;
+    const apiControlsBefore = apiControlsSignature();
+    const historyOpen = state.setupOpen && state.settingsTab === 'history';
+    const ledgerBefore = historyOpen ? JSON.stringify(state.ledger) : '';
     const lastAttackPoll = state.api.lastAttackPoll;
     const lastChainPoll = state.api.lastChainPoll;
+
     state.roster = Array.isArray(shared.roster) ? shared.roster.map(normalizeParticipant) : state.roster;
     state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
     state.template = typeof shared.template === 'string' ? shared.template : state.template;
@@ -539,7 +558,7 @@
       lastAttackPoll,
       lastChainPoll
     });
-    history = Array.isArray(shared.history) ? clone(shared.history).slice(-MAX_HISTORY) : history;
+    history = Array.isArray(shared.history) ? shared.history.slice(-MAX_HISTORY) : history;
 
     const runtime = shared.runtime || {};
     lastUpName = String(runtime.lastUpName || '');
@@ -550,9 +569,20 @@
     dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
     criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
 
+    const rosterChanged = JSON.stringify(state.roster) !== rosterBefore;
+    const templateChanged = state.template !== templateBefore;
+    const apiControlsChanged = apiControlsSignature() !== apiControlsBefore;
+    const ledgerChanged = historyOpen && JSON.stringify(state.ledger) !== ledgerBefore;
+    const settingsChanged = state.setupOpen && (
+      (state.settingsTab === 'roster' && rosterChanged) ||
+      (state.settingsTab === 'message' && templateChanged) ||
+      (state.settingsTab === 'api' && apiControlsChanged) ||
+      (state.settingsTab === 'history' && ledgerChanged)
+    );
+
     recordSharedStamp(envelope);
     lastPublishedSharedJson = JSON.stringify(buildSharedSnapshot());
-    refresh({ roster: true, pending: true, settings: true });
+    refresh({ roster: rosterChanged, settings: settingsChanged });
     return true;
   }
 
@@ -605,7 +635,7 @@
     lastLeaderRenewAt = 0;
   }
 
-  function maintainApiLeadership() {
+  function maintainApiLeadership({ forceRenew = false } = {}) {
     if (!automationActive()) {
       releaseApiLeadership();
       return false;
@@ -614,7 +644,7 @@
     const now = Date.now();
     const lease = readApiLeaderLease();
     if (lease?.id === TAB_ID && Number(lease.expiresAt) > now) {
-      if (now - lastLeaderRenewAt >= API_LEADER_RENEW_MS) {
+      if (forceRenew || now - lastLeaderRenewAt >= API_LEADER_RENEW_MS) {
         const renewed = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS, visible: !document.hidden };
         try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(renewed)); } catch {}
         lastLeaderRenewAt = now;
@@ -646,9 +676,11 @@
     return isApiLeader() ? 'LEADER' : 'FOLLOWER';
   }
 
-  function saveNow() {
+  function saveNow({ sync = true } = {}) {
+    const shouldSync = sync || saveTimerSync;
     clearTimeout(saveTimer);
     saveTimer = null;
+    saveTimerSync = false;
     state.schemaVersion = SCHEMA_VERSION;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -656,12 +688,22 @@
       console.warn('[Merc-C-Que] State save failed:', error);
     }
     persistPdaUiState();
-    publishSharedState();
+    if (shouldSync) publishSharedState();
   }
 
-  function saveSoon(delay = 350) {
+  function saveLocalNow() {
+    saveNow({ sync: false });
+  }
+
+  function saveSoon(delay = 350, { sync = true } = {}) {
+    const pendingSync = saveTimer ? saveTimerSync : false;
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveNow, delay);
+    saveTimerSync = pendingSync || sync;
+    saveTimer = setTimeout(() => saveNow({ sync: saveTimerSync }), delay);
+  }
+
+  function saveLocalSoon(delay = 350) {
+    saveSoon(delay, { sync: false });
   }
 
   function gmGet(key, fallback = '') {
@@ -1609,10 +1651,10 @@
   function schedulerTick() {
     trackUpTimer();
     const leader = maintainApiLeadership();
-    const role = tabApiRole();
+    const role = automationActive() ? (leader ? 'LEADER' : 'FOLLOWER') : '—';
     if (role !== lastReportedTabRole) {
       lastReportedTabRole = role;
-      updateApiStatusBox();
+      updateApiStatusBox(role);
     }
     if (leader) runDangerAlerts();
     if (!(IS_PDA && launcherDismissedForSession)) {
@@ -1748,13 +1790,13 @@
       state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
     }
     state.minimized = true;
-    saveNow();
+    saveLocalNow();
     renderApp();
   }
 
   function restoreApp() {
     state.minimized = false;
-    saveNow();
+    saveLocalNow();
     renderApp();
   }
 
@@ -2028,15 +2070,16 @@
     }
   }
 
-  function updateApiStatusBox() {
+  function updateApiStatusBox(roleOverride = null) {
     const box = document.querySelector('#hkmcq-api-status');
     if (!box) return;
     const last = state.api.lastHit ? `${state.api.lastHit.attacker} at #${state.api.lastHit.chain}` : '—';
+    const apiRole = roleOverride || tabApiRole();
     box.innerHTML =
       `Platform: <strong>${platformLabel()}</strong>` +
       `<br>Key: <strong>${PDA_INJECTED_KEY ? 'Torn PDA injected' : hasApiKey() ? 'Saved' : 'Not saved'}</strong>` +
       `<br>Status: ${escapeHtml(state.api.status || '—')}` +
-      `<br>Tab API role: <strong>${tabApiRole()}</strong>` +
+      `<br>Tab API role: <strong>${apiRole}</strong>` +
       `<br>Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}` +
       `<br>Chain clock: ${formatCountdown(remainingChainSeconds())}` +
       `<br>Last detected: ${escapeHtml(last)}` +
@@ -2181,7 +2224,7 @@
   }
 
   function rerenderSettings() {
-    saveNow();
+    saveLocalNow();
     renderSettings();
     requestAnimationFrame(adjustPanelViewport);
   }
@@ -2330,7 +2373,7 @@
       if (panel) {
         const rect = panel.getBoundingClientRect();
         state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
-        saveNow();
+        saveLocalNow();
         adjustPanelViewport();
       }
       panelDrag = null;
@@ -2340,7 +2383,7 @@
       if (launcher) {
         const rect = launcher.getBoundingClientRect();
         state.launcherPosition = { left: Math.round(rect.left), top: Math.round(rect.top) };
-        saveNow();
+        saveLocalNow();
       }
       if (launcherDrag.moved) suppressLauncherClickUntil = Date.now() + 250;
       launcherDrag = null;
@@ -2380,7 +2423,7 @@
       setPosition(launcher, position);
       state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
     }
-    saveSoon();
+    saveLocalSoon();
   });
 
   function toast(message) {
@@ -2410,7 +2453,7 @@
 
   window.addEventListener('pagehide', () => {
     // Flush any debounced save; saveNow() also persists PDA UI state.
-    if (saveTimer) saveNow();
+    if (saveTimer) saveNow({ sync: saveTimerSync });
     else persistPdaUiState();
     releaseApiLeadership();
   });
@@ -2419,7 +2462,7 @@
     const now = Date.now();
     const gap = now - lastVisibilityChangeAt;
     lastVisibilityChangeAt = now;
-    if (isApiLeader()) maintainApiLeadership();
+    if (automationActive()) maintainApiLeadership({ forceRenew: true });
     if (document.hidden) persistPdaUiState();
     if (!document.hidden && gap >= 15000) {
       reconcileAfterResume(IS_PDA ? 'Torn PDA resume' : 'tab resume');
