@@ -17,85 +17,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: v2.5.11-clock-safety
-
-      - name: Prepare release files
+      - name: Point updater to main
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-
-          script = Path('HKs-Merc-C-Que.user.js')
-          text = script.read_text(encoding='utf-8')
-          text = text.replace(
-              'https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.11-clock-safety/HKs-Merc-C-Que.user.js',
-              'https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js'
-          )
-          script.write_text(text, encoding='utf-8')
-
-          readme = Path('README.md')
-          text = readme.read_text(encoding='utf-8')
-          text = text.replace('**Current version:** v2.5.10', '**Current version:** v2.5.11', 1)
-          marker = '- Chain danger/critical countdown alerts with optional sound\n'
-          additions = (
-              '- Torn-calibrated chain countdown with a conservative 3-second safety buffer\n'
-              '- Broken or expired chains reset Auto/Assisted hit numbering back to HIT #1\n'
-              '- Torn PDA minimized launcher can be temporarily hidden for the current session\n'
-              '- Smoother drag handling and lighter minimized-launcher updates\n'
-          )
-          if additions not in text:
-              text = text.replace(marker, marker + additions, 1)
-          old = 'Merc-C-Que becomes a small draggable launcher showing the current queued player, assigned hit number, and chain clock when available. Its position is remembered. Click the launcher to restore the full panel.\n'
-          new = old + '\nOn Torn PDA, the minimized launcher also includes a small **×** that hides Merc-C-Que for the current PDA/webview session without deleting queue, API, or saved UI data.\n'
-          text = text.replace(old, new, 1)
-          old_rel = '- Change-aware chain polling so unchanged polls avoid unnecessary state serialization/storage writes\n'
-          new_rel = old_rel + '- Torn server-time calibration for the live chain clock, with local fallback if calibration is unavailable\n- Conservative 3-second chain-clock safety margin\n- Automatic reset to HIT #1 when Torn reports no active chain\n'
-          text = text.replace(old_rel, new_rel, 1)
-          readme.write_text(text, encoding='utf-8')
-
-          changelog = Path('CHANGELOG.md')
-          text = changelog.read_text(encoding='utf-8')
-          entry = '''## [2.5.11] - Release
-
-### Chain clock / safety
-- Added a conservative 3-second safety buffer so Merc-C-Que warns slightly earlier than Torn's displayed chain deadline
-- Calibrated the live countdown against Torn server time and aligned local countdown updates to calibrated second boundaries
-- Added a local fallback path if Torn clock calibration is unavailable
-- Preserved neutral danger/critical alerts during hits 1-9
-
-### Chain reset behavior
-- Fixed Auto/Assisted hit numbering remaining stuck on a previous short or broken chain
-- When Torn reports no active chain, Merc-C-Que now clears stale chain state and returns the next assigned hit to HIT #1
-- Backward-count protection is limited to established 10+ chains so a new warm-up can begin normally
-
-### Torn PDA / UI polish
-- Added a temporary PDA-only × control on the minimized launcher to hide Merc-C-Que for the current session
-- Session-close state survives Torn page navigation within the same PDA/webview session
-- Batched drag movement with requestAnimationFrame for smoother touch/mouse dragging
-- Reduced unnecessary minimized-launcher DOM rebuilding and hidden UI refresh work
-
-### Validation
-- JavaScript syntax/verification checks passed during development
-- Broken-chain reset behavior was confirmed during several live short-chain tests before release
-
-'''
-          if '## [2.5.11] - Release' not in text:
-              text = text.replace('# Changelog\n\n', '# Changelog\n\n' + entry, 1)
-          changelog.write_text(text, encoding='utf-8')
-          PY
-
+          sed -i 's#HairyKary/HKs-Merc-C-Que/v2.5.11-clock-safety/HKs-Merc-C-Que.user.js#HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js#g' HKs-Merc-C-Que.user.js
           node --check HKs-Merc-C-Que.user.js
-          grep -q '// @version      2.5.11' HKs-Merc-C-Que.user.js
-          grep -q 'const VERSION = '\''2.5.11'\''' HKs-Merc-C-Que.user.js
-          grep -q '@updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js' HKs-Merc-C-Que.user.js
-          grep -q 'CHAIN_CLOCK_SAFETY_SECONDS = 3' HKs-Merc-C-Que.user.js
-          grep -q 'TORN_CLOCK_SYNC_INTERVAL_MS = 60000' HKs-Merc-C-Que.user.js
-          grep -q 'state.manualNextHit = 1' HKs-Merc-C-Que.user.js
-          grep -q '**Current version:** v2.5.11' README.md
-          grep -q '## \[2.5.11\] - Release' CHANGELOG.md
-
-      - name: Commit release prep
+          grep -Fq '// @version      2.5.11' HKs-Merc-C-Que.user.js
+          grep -Fq '// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js' HKs-Merc-C-Que.user.js
+          grep -Fq 'const CHAIN_CLOCK_SAFETY_SECONDS = 3;' HKs-Merc-C-Que.user.js
+          grep -Fq 'const TORN_CLOCK_SYNC_INTERVAL_MS = 60000;' HKs-Merc-C-Que.user.js
+      - name: Commit release metadata
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add HKs-Merc-C-Que.user.js README.md CHANGELOG.md
-          git commit -m "Prepare v2.5.11 release" || exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HKs-Merc-C-Que.user.js
+          git commit -m 'Point v2.5.11 updates to main' || exit 0
           git push origin HEAD:v2.5.11-clock-safety
