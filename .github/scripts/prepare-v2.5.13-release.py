@@ -21,7 +21,7 @@ script_path.write_text(script, encoding='utf-8')
 # README release status/features.
 readme_path = Path('README.md')
 readme = readme_path.read_text(encoding='utf-8')
-readme = replace_once(readme, '> **Current version:** v2.5.11  ', '> **Current version:** v2.5.13  ', 'README version')
+readme = replace_once(readme, '> **Current version:** v2.5.11  ', '> **Current version:** v2.5.13', 'README version')
 feature_anchor = '- Smoother drag handling and lighter minimized-launcher updates\n- Optional warning when the same player remains UP too long\n'
 feature_replacement = '''- Smoother drag handling and lighter minimized-launcher updates
 - Multi-tab synchronization with one elected API leader tab and fast shared queue/chain state
