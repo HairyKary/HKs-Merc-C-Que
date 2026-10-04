@@ -15,8 +15,8 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.13-pda-tempo-bulk/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.13-pda-tempo-bulk/HKs-Merc-C-Que.user.js
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
@@ -47,7 +47,7 @@
   const API_LEADER_RENEW_MS = 1200;
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
-  const MAX_PENDING = 50;
+  const MAX_PENDING = 200;
   const MAX_LEDGER = 200;
   const DANGER_SECONDS = 60;
   const CRITICAL_SECONDS = 30;
