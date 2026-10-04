@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Release  
-> **Current version:** v2.5.11  
+> **Current version:** v2.5.13
 > Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
@@ -45,6 +45,11 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Broken or expired chains reset Auto/Assisted hit numbering back to HIT #1
 - Torn PDA minimized launcher can be temporarily hidden for the current session
 - Smoother drag handling and lighter minimized-launcher updates
+- Multi-tab synchronization with one elected API leader tab and fast shared queue/chain state
+- Compact Torn PDA view for UP / NEXT / ON DECK / chain status
+- Optional configurable HIT NOW chain-tempo guidance
+- Bulk **ADD / RECORD ALL** and **IGNORE ALL** actions for pending-hit backlogs
+- Pending-hit queue capacity increased to 200 events
 - Optional warning when the same player remains UP too long
 
 ## Installation
@@ -120,6 +125,8 @@ Merc-C-Que includes:
 - Torn server-time calibration for the live chain clock, with local fallback if calibration is unavailable
 - Conservative 3-second chain-clock safety margin
 - Automatic reset to HIT #1 when Torn reports no active chain
+- Multi-tab API leader election so only one active Torn tab performs routine API polling
+- BroadcastChannel synchronization with local-storage fallback for queue and chain state across tabs
 
 ## Undo Behavior
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.5.13] - Release
+
+### Multi-tab war synchronization
+- Added same-browser multi-tab state synchronization for queue, chain, pending-hit, roster, and API status data
+- Added API leader election so only one active Torn tab performs routine polling while follower tabs receive shared updates
+- Visible tabs can take leadership from hidden/background tabs, with automatic handoff if the leader closes or becomes unavailable
+- Reduced redundant shared-state serialization, DOM refreshes, and UI-only broadcasts after live multi-tab testing
+
+### Torn PDA / chain control
+- Added an optional compact PDA view showing UP NOW, NEXT, ON DECK, chain status, pending-hit attention, and tempo guidance
+- Compact/full PDA mode is stored locally on the PDA and does not force the same layout onto desktop tabs
+- Added optional configurable HIT NOW guidance with a 60-300 second threshold; default is 120 seconds and the feature is off by default
+- Warm-up hits 1-9 show HIT NOW / BUILD CHAIN when tempo guidance is enabled
+
+### Pending-hit backlog tools
+- Added **ADD / RECORD ALL** to process pending hits oldest-to-newest while preserving individual ledger entries
+- Added **IGNORE ALL** to clear a pending backlog while marking the existing ledger entries ignored
+- Unknown players encountered by bulk recording are added to the roster only once
+- Increased the pending-hit queue capacity from 50 to 200 events for unattended war backlogs
+
+### Validation
+- Multi-tab synchronization tested across several Torn tabs and screens
+- Desktop and Torn PDA changes tested during multiple live chains, including a chain to 100
+- Bulk IGNORE ALL and ADD / RECORD ALL tested repeatedly with large pending-hit backlogs
+- JavaScript syntax and diff checks passed during release preparation
+
 ## [2.5.11] - Release
 
 ### Chain clock / safety

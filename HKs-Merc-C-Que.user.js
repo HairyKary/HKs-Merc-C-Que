@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.11
+// @version      2.5.13
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -22,8 +22,8 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.11';
-  const SCHEMA_VERSION = 5;
+  const VERSION = '2.5.13';
+  const SCHEMA_VERSION = 6;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
   const API_KEY_STORE = 'hksMercCQue_apiKey';
@@ -36,18 +36,25 @@
   const PDA_API_KEY_LITERAL = '###PDA-APIKEY###';
   const PDA_API_KEY_PLACEHOLDER = ['###PDA-', 'APIKEY###'].join('');
   const PDA_MINIMIZED_STORE = 'ui_minimized';
+  const PDA_COMPACT_STORE = 'ui_compact';
   const PDA_LAUNCHER_POSITION_STORE = 'ui_launcher_position';
   const PDA_PANEL_POSITION_STORE = 'ui_panel_position';
   const PDA_SESSION_DISMISS_STORE = 'hkmcq_pda_launcher_dismissed';
+  const TAB_SYNC_CHANNEL_NAME = 'hksMercCQue_v2_tab_sync';
+  const TAB_SHARED_STATE_STORE = 'hksMercCQue_v2_shared_state';
+  const TAB_LEADER_STORE = 'hksMercCQue_v2_api_leader';
+  const API_LEADER_LEASE_MS = 4000;
+  const API_LEADER_RENEW_MS = 1200;
   const MAX_HISTORY = 40;
   const MAX_PROCESSED = 300;
-  const MAX_PENDING = 50;
+  const MAX_PENDING = 200;
   const MAX_LEDGER = 200;
   const DANGER_SECONDS = 60;
   const CRITICAL_SECONDS = 30;
   const CHAIN_CLOCK_SAFETY_SECONDS = 3;
   const TORN_CLOCK_SYNC_INTERVAL_MS = 60000;
   const DEFAULT_WAIT_WARNING_SECONDS = 240;
+  const DEFAULT_HIT_TEMPO_SECONDS = 120;
   const DEFAULT_TEMPLATE =
     'HIT #{hit} | UP: {current} | NEXT: {next} (#{next_hit}) | ON DECK: {ondeck} (#{ondeck_hit})';
 
@@ -57,6 +64,7 @@
     manualNextHit: 1,
     template: DEFAULT_TEMPLATE,
     minimized: false,
+    compact: false,
     setupOpen: false,
     settingsTab: 'roster',
     position: null,
@@ -64,7 +72,9 @@
     ui: {
       soundAlerts: false,
       waitWarning: true,
-      waitWarningSeconds: DEFAULT_WAIT_WARNING_SECONDS
+      waitWarningSeconds: DEFAULT_WAIT_WARNING_SECONDS,
+      hitTempoEnabled: false,
+      hitTempoSeconds: DEFAULT_HIT_TEMPO_SECONDS
     },
     ledger: [],
     api: {
@@ -142,6 +152,7 @@
   if (PDA_STORAGE) {
     const savedPdaUi = await loadPdaUiState();
     if (typeof savedPdaUi.minimized === 'boolean') state.minimized = savedPdaUi.minimized;
+    if (typeof savedPdaUi.compact === 'boolean') state.compact = savedPdaUi.compact;
     if (savedPdaUi.launcherPosition) state.launcherPosition = savedPdaUi.launcherPosition;
     if (savedPdaUi.panelPosition) state.position = savedPdaUi.panelPosition;
   }
@@ -150,6 +161,7 @@
   let rosterDraft = null;
   let apiKeyDraft = '';
   let saveTimer = null;
+  let saveTimerSync = false;
   let pdaUiSaveChain = Promise.resolve();
   let attackInFlight = false;
   let chainInFlight = false;
@@ -170,6 +182,17 @@
   let tornClockSyncedAt = 0;
   let tornClockSyncInFlight = false;
   let chainDeadlineTornMs = 0;
+  const TAB_ID = (() => {
+    try { if (crypto?.randomUUID) return crypto.randomUUID(); } catch {}
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  })();
+  let syncChannel = null;
+  let sharedSequence = 0;
+  let lastSharedStamp = { updatedAt: 0, sourceId: '', sequence: 0 };
+  let lastPublishedSharedJson = '';
+  let lastLeaderRenewAt = 0;
+  let wasApiLeader = false;
+  let lastReportedTabRole = '';
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function clamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
@@ -211,13 +234,15 @@
   }
 
   async function loadPdaUiState() {
-    const [minimizedRaw, launcherRaw, panelRaw] = await Promise.all([
+    const [minimizedRaw, compactRaw, launcherRaw, panelRaw] = await Promise.all([
       pdaStorageGet(PDA_MINIMIZED_STORE, null),
+      pdaStorageGet(PDA_COMPACT_STORE, null),
       pdaStorageGet(PDA_LAUNCHER_POSITION_STORE, null),
       pdaStorageGet(PDA_PANEL_POSITION_STORE, null)
     ]);
     return {
       minimized: typeof minimizedRaw === 'boolean' ? minimizedRaw : null,
+      compact: typeof compactRaw === 'boolean' ? compactRaw : null,
       launcherPosition: normalizeStoredPosition(launcherRaw),
       panelPosition: normalizeStoredPosition(panelRaw)
     };
@@ -227,6 +252,7 @@
     if (!PDA_STORAGE) return;
     const snapshot = {
       minimized: state.minimized === true,
+      compact: state.compact === true,
       launcherPosition: normalizeStoredPosition(state.launcherPosition),
       panelPosition: normalizeStoredPosition(state.position)
     };
@@ -234,6 +260,7 @@
       .catch(() => {})
       .then(async () => {
         await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized);
+        await pdaStorageSet(PDA_COMPACT_STORE, snapshot.compact);
         if (snapshot.launcherPosition) {
           await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition));
         }
@@ -414,7 +441,10 @@
     next.ledger = normalizeLedger(saved.ledger);
     next.ui = { ...clone(DEFAULT_STATE.ui), ...(saved.ui || {}) };
     next.ui.waitWarningSeconds = clamp(Number(next.ui.waitWarningSeconds) || DEFAULT_WAIT_WARNING_SECONDS, 60, 900);
+    next.ui.hitTempoEnabled = next.ui.hitTempoEnabled === true;
+    next.ui.hitTempoSeconds = clamp(Number(next.ui.hitTempoSeconds) || DEFAULT_HIT_TEMPO_SECONDS, 60, 300);
     next.minimized = typeof saved.minimized === 'boolean' ? saved.minimized : !!saved.collapsed;
+    next.compact = typeof saved.compact === 'boolean' ? saved.compact : false;
     if (!['roster', 'message', 'api', 'history'].includes(next.settingsTab)) next.settingsTab = 'roster';
     delete next.collapsed;
     return next;
@@ -442,9 +472,233 @@
     return clone(DEFAULT_STATE);
   }
 
-  function saveNow() {
+  function buildSharedSnapshot() {
+    const api = { ...state.api };
+    delete api.lastAttackPoll;
+    delete api.lastChainPoll;
+    return {
+      schemaVersion: state.schemaVersion,
+      roster: state.roster,
+      manualNextHit: state.manualNextHit,
+      template: state.template,
+      ui: state.ui,
+      ledger: state.ledger,
+      api,
+      history,
+      runtime: {
+        lastUpName,
+        upSince,
+        tornClockOffsetMs,
+        tornClockSyncedAt,
+        chainDeadlineTornMs,
+        dangerAlertedForHit,
+        criticalAlertedForHit
+      }
+    };
+  }
+
+  function sharedStampIsNewer(envelope) {
+    const updatedAt = Number(envelope?.updatedAt) || 0;
+    const sourceId = String(envelope?.sourceId || '');
+    const sequence = Number(envelope?.sequence) || 0;
+    if (updatedAt !== lastSharedStamp.updatedAt) return updatedAt > lastSharedStamp.updatedAt;
+    if (sourceId !== lastSharedStamp.sourceId) return sourceId > lastSharedStamp.sourceId;
+    return sequence > lastSharedStamp.sequence;
+  }
+
+  function recordSharedStamp(envelope) {
+    lastSharedStamp = {
+      updatedAt: Number(envelope?.updatedAt) || 0,
+      sourceId: String(envelope?.sourceId || ''),
+      sequence: Number(envelope?.sequence) || 0
+    };
+  }
+
+  function apiControlsSignature(api = state.api, ui = state.ui) {
+    return [
+      api.mode,
+      api.attackPollSeconds,
+      api.chainPollSeconds,
+      api.paused ? 1 : 0,
+      api.lastError || '',
+      api.backoffUntil || 0,
+      api.reconciliationNote || '',
+      ui.soundAlerts ? 1 : 0,
+      ui.waitWarning ? 1 : 0,
+      ui.waitWarningSeconds,
+      ui.hitTempoEnabled ? 1 : 0,
+      ui.hitTempoSeconds
+    ].join('|');
+  }
+
+  function publishSharedState(force = false) {
+    const snapshot = buildSharedSnapshot();
+    const snapshotJson = JSON.stringify(snapshot);
+    if (!force && snapshotJson === lastPublishedSharedJson) return;
+
+    const envelope = {
+      type: 'state',
+      sourceId: TAB_ID,
+      updatedAt: Date.now(),
+      sequence: ++sharedSequence,
+      snapshot
+    };
+    lastPublishedSharedJson = snapshotJson;
+    recordSharedStamp(envelope);
+
+    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(envelope)); }
+    catch (error) { console.warn('[Merc-C-Que] Shared-state save failed:', error); }
+    try { syncChannel?.postMessage(envelope); } catch {}
+  }
+
+  function applySharedEnvelope(envelope) {
+    if (!envelope || envelope.type !== 'state' || envelope.sourceId === TAB_ID) return false;
+    if (!sharedStampIsNewer(envelope)) return false;
+    const shared = envelope.snapshot;
+    if (!shared || typeof shared !== 'object') return false;
+
+    const rosterBefore = JSON.stringify(state.roster);
+    const templateBefore = state.template;
+    const apiControlsBefore = apiControlsSignature();
+    const historyOpen = state.setupOpen && state.settingsTab === 'history';
+    const ledgerBefore = historyOpen ? JSON.stringify(state.ledger) : '';
+    const lastAttackPoll = state.api.lastAttackPoll;
+    const lastChainPoll = state.api.lastChainPoll;
+
+    state.roster = Array.isArray(shared.roster) ? shared.roster.map(normalizeParticipant) : state.roster;
+    state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
+    state.template = typeof shared.template === 'string' ? shared.template : state.template;
+    state.ui = { ...state.ui, ...(shared.ui || {}) };
+    state.ledger = normalizeLedger(shared.ledger);
+    state.api = normalizeApi({
+      ...state.api,
+      ...(shared.api || {}),
+      lastAttackPoll,
+      lastChainPoll
+    });
+    history = Array.isArray(shared.history) ? shared.history.slice(-MAX_HISTORY) : history;
+
+    const runtime = shared.runtime || {};
+    lastUpName = String(runtime.lastUpName || '');
+    upSince = Number(runtime.upSince) || Date.now();
+    tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
+    tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
+    chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
+    dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
+    criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+
+    const rosterChanged = JSON.stringify(state.roster) !== rosterBefore;
+    const templateChanged = state.template !== templateBefore;
+    const apiControlsChanged = apiControlsSignature() !== apiControlsBefore;
+    const ledgerChanged = historyOpen && JSON.stringify(state.ledger) !== ledgerBefore;
+    const settingsChanged = state.setupOpen && (
+      (state.settingsTab === 'roster' && rosterChanged) ||
+      (state.settingsTab === 'message' && templateChanged) ||
+      (state.settingsTab === 'api' && apiControlsChanged) ||
+      (state.settingsTab === 'history' && ledgerChanged)
+    );
+
+    recordSharedStamp(envelope);
+    lastPublishedSharedJson = JSON.stringify(buildSharedSnapshot());
+    refresh({ roster: rosterChanged, settings: settingsChanged });
+    return true;
+  }
+
+  function initTabSync() {
+    try {
+      if (typeof BroadcastChannel === 'function') {
+        syncChannel = new BroadcastChannel(TAB_SYNC_CHANNEL_NAME);
+        syncChannel.addEventListener('message', event => applySharedEnvelope(event.data));
+      }
+    } catch (error) {
+      console.warn('[Merc-C-Que] BroadcastChannel unavailable; using storage sync:', error);
+      syncChannel = null;
+    }
+
+    window.addEventListener('storage', event => {
+      if (event.key !== TAB_SHARED_STATE_STORE || !event.newValue) return;
+      try { applySharedEnvelope(JSON.parse(event.newValue)); } catch {}
+    });
+
+    let existing = null;
+    try {
+      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
+      if (raw) existing = JSON.parse(raw);
+    } catch {}
+    if (!applySharedEnvelope(existing)) publishSharedState(true);
+  }
+
+  function readApiLeaderLease() {
+    try {
+      const raw = localStorage.getItem(TAB_LEADER_STORE);
+      if (!raw) return null;
+      const lease = JSON.parse(raw);
+      return lease && lease.id ? lease : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isApiLeader() {
+    const lease = readApiLeaderLease();
+    return !!lease && lease.id === TAB_ID && Number(lease.expiresAt) > Date.now();
+  }
+
+  function releaseApiLeadership() {
+    const lease = readApiLeaderLease();
+    if (lease?.id === TAB_ID) {
+      try { localStorage.removeItem(TAB_LEADER_STORE); } catch {}
+    }
+    wasApiLeader = false;
+    lastLeaderRenewAt = 0;
+  }
+
+  function maintainApiLeadership({ forceRenew = false } = {}) {
+    if (!automationActive()) {
+      releaseApiLeadership();
+      return false;
+    }
+
+    const now = Date.now();
+    const lease = readApiLeaderLease();
+    if (lease?.id === TAB_ID && Number(lease.expiresAt) > now) {
+      if (forceRenew || now - lastLeaderRenewAt >= API_LEADER_RENEW_MS) {
+        const renewed = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS, visible: !document.hidden };
+        try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(renewed)); } catch {}
+        lastLeaderRenewAt = now;
+      }
+      wasApiLeader = true;
+      return true;
+    }
+
+    if (lease?.id && Number(lease.expiresAt) > now) {
+      const visibleCanPreemptHidden = !document.hidden && lease.visible === false;
+      if (!visibleCanPreemptHidden) {
+        wasApiLeader = false;
+        return false;
+      }
+    }
+
+    const candidate = { id: TAB_ID, expiresAt: now + API_LEADER_LEASE_MS, visible: !document.hidden };
+    try { localStorage.setItem(TAB_LEADER_STORE, JSON.stringify(candidate)); } catch {}
+    const confirmed = readApiLeaderLease();
+    const won = confirmed?.id === TAB_ID && Number(confirmed.expiresAt) > now;
+    if (won && !wasApiLeader) resetPollTimers();
+    wasApiLeader = won;
+    if (won) lastLeaderRenewAt = now;
+    return won;
+  }
+
+  function tabApiRole() {
+    if (!automationActive()) return '—';
+    return isApiLeader() ? 'LEADER' : 'FOLLOWER';
+  }
+
+  function saveNow({ sync = true } = {}) {
+    const shouldSync = sync || saveTimerSync;
     clearTimeout(saveTimer);
     saveTimer = null;
+    saveTimerSync = false;
     state.schemaVersion = SCHEMA_VERSION;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -452,11 +706,22 @@
       console.warn('[Merc-C-Que] State save failed:', error);
     }
     persistPdaUiState();
+    if (shouldSync) publishSharedState();
   }
 
-  function saveSoon(delay = 350) {
+  function saveLocalNow() {
+    saveNow({ sync: false });
+  }
+
+  function saveSoon(delay = 350, { sync = true } = {}) {
+    const pendingSync = saveTimer ? saveTimerSync : false;
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveNow, delay);
+    saveTimerSync = pendingSync || sync;
+    saveTimer = setTimeout(() => saveNow({ sync: saveTimerSync }), delay);
+  }
+
+  function saveLocalSoon(delay = 350) {
+    saveSoon(delay, { sync: false });
   }
 
   function gmGet(key, fallback = '') {
@@ -782,6 +1047,7 @@
       generatedAt: new Date().toISOString(),
       platform: platformLabel(),
       pdaStorage: !!PDA_STORAGE,
+      tabSync: { tabId: TAB_ID, apiRole: tabApiRole(), broadcastChannel: !!syncChannel },
       mode: state.api.mode,
       paused: state.api.paused,
       chain: {
@@ -888,7 +1154,7 @@
   }
 
   async function syncTornClock({ force = false } = {}) {
-    if (!hasApiKey() || tornClockSyncInFlight) return false;
+    if (!isApiLeader() || !hasApiKey() || tornClockSyncInFlight) return false;
     const now = Date.now();
     if (!force && tornClockSyncedAt && now - tornClockSyncedAt < TORN_CLOCK_SYNC_INTERVAL_MS) return true;
 
@@ -1051,7 +1317,7 @@
   }
 
   async function pollAttacks({ forceBaseline = false, reconciliation = false } = {}) {
-    if (attackInFlight || !hasApiKey()) return;
+    if (!isApiLeader() || attackInFlight || !hasApiKey()) return;
     if (inBackoff()) return;
     attackInFlight = true;
     state.api.lastAttackPoll = Date.now();
@@ -1066,6 +1332,7 @@
     }
 
     try {
+      if (!isApiLeader()) return;
       const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
       const hadSyncError = hasSyncError();
       const statusBefore = state.api.status;
@@ -1123,7 +1390,7 @@
   }
 
   async function pollChain({ reconciliation = false } = {}) {
-    if (chainInFlight || !hasApiKey()) return;
+    if (!isApiLeader() || chainInFlight || !hasApiKey()) return;
     if (inBackoff()) return;
     chainInFlight = true;
     state.api.lastChainPoll = Date.now();
@@ -1141,6 +1408,7 @@
     }
 
     try {
+      if (!isApiLeader()) return;
       const before = chainSnapshot();
       const hadSyncError = hasSyncError();
       const chain = data?.chain || null;
@@ -1205,6 +1473,10 @@
 
   async function reconcileAfterResume(reason = 'resume') {
     if (reconciliationInFlight || !automationActive()) return;
+    if (!maintainApiLeadership()) {
+      refresh({ settings: true });
+      return;
+    }
     reconciliationInFlight = true;
     state.api.status = `Rechecking Torn after ${reason}…`;
     refresh();
@@ -1256,6 +1528,8 @@
     const soundElement = document.querySelector('#hkmcq-sound-alerts');
     const waitElement = document.querySelector('#hkmcq-wait-warning');
     const waitSecondsElement = document.querySelector('#hkmcq-wait-seconds');
+    const tempoElement = document.querySelector('#hkmcq-hit-tempo');
+    const tempoSecondsElement = document.querySelector('#hkmcq-hit-tempo-seconds');
     const oldMode = state.api.mode;
     if (modeElement) state.api.mode = modeElement.value;
     if (attackElement) state.api.attackPollSeconds = clamp(Number(attackElement.value) || 8, 3, 60);
@@ -1264,6 +1538,10 @@
     if (waitElement) state.ui.waitWarning = !!waitElement.checked;
     if (waitSecondsElement) {
       state.ui.waitWarningSeconds = clamp(Number(waitSecondsElement.value) || DEFAULT_WAIT_WARNING_SECONDS, 60, 900);
+    }
+    if (tempoElement) state.ui.hitTempoEnabled = !!tempoElement.checked;
+    if (tempoSecondsElement) {
+      state.ui.hitTempoSeconds = clamp(Number(tempoSecondsElement.value) || DEFAULT_HIT_TEMPO_SECONDS, 60, 300);
     }
     if (oldMode === 'manual' && state.api.mode !== 'manual') {
       resetApiWatch();
@@ -1281,7 +1559,7 @@
     renderSettings();
     refresh();
     toast('API settings saved.');
-    if (automationActive()) {
+    if (automationActive() && maintainApiLeadership()) {
       syncTornClock().finally(() => pollChain());
       pollAttacks({ forceBaseline: !state.api.baselineReady });
     }
@@ -1348,6 +1626,51 @@
     refresh({ pending: true, settings: true });
   }
 
+  function recordAllPendingHits() {
+    const count = state.api.pendingHits.length;
+    if (!count) return;
+    if (!confirm(`Record all ${count} pending hits? Unknown players will be added to the queue.`)) return;
+
+    const pending = [...state.api.pendingHits].sort((a, b) =>
+      (Number(a.ended) - Number(b.ended)) ||
+      (Number(a.chain) - Number(b.chain)) ||
+      String(a.id).localeCompare(String(b.id))
+    );
+    pushHistory(`record all ${count} pending hits`);
+
+    let added = 0;
+    for (const event of pending) {
+      const index = findParticipantIndex(event.attacker);
+      if (index < 0) {
+        state.roster.push({ name: event.attacker, status: 'ready', hits: 1 });
+        added += 1;
+        updateLedgerAction(event.id, 'added-and-recorded');
+      } else {
+        rotateParticipant(event.attacker, { recordHit: true, saveHistory: false });
+        updateLedgerAction(event.id, 'recorded');
+      }
+    }
+
+    state.api.pendingHits = [];
+    state.api.status = `Recorded ${count} pending hit${count === 1 ? '' : 's'}${added ? `; added ${added} new player${added === 1 ? '' : 's'}` : ''}`;
+    trackUpTimer();
+    saveNow();
+    refresh({ roster: true, pending: true, settings: true });
+    toast(`Recorded ${count} pending hit${count === 1 ? '' : 's'}.`);
+  }
+
+  function ignoreAllPendingHits() {
+    const count = state.api.pendingHits.length;
+    if (!count) return;
+    if (!confirm(`Ignore all ${count} pending hits?`)) return;
+    state.api.pendingHits.forEach(event => updateLedgerAction(event.id, 'ignored'));
+    state.api.pendingHits = [];
+    state.api.status = `Ignored ${count} pending hit${count === 1 ? '' : 's'}`;
+    saveNow();
+    refresh({ pending: true, settings: true });
+    toast(`Ignored ${count} pending hit${count === 1 ? '' : 's'}.`);
+  }
+
   function desiredPollSeconds(base) {
     const remaining = remainingChainSeconds();
     if (remaining != null && remaining <= DANGER_SECONDS) return 3;
@@ -1396,12 +1719,18 @@
 
   function schedulerTick() {
     trackUpTimer();
-    runDangerAlerts();
+    const leader = maintainApiLeadership();
+    const role = automationActive() ? (leader ? 'LEADER' : 'FOLLOWER') : '—';
+    if (role !== lastReportedTabRole) {
+      lastReportedTabRole = role;
+      updateApiStatusBox(role);
+    }
+    if (leader) runDangerAlerts();
     if (!(IS_PDA && launcherDismissedForSession)) {
       if (state.minimized) refreshLauncher();
       else refreshLiveIndicators();
     }
-    if (!automationActive() || inBackoff()) return;
+    if (!automationActive() || !leader || inBackoff()) return;
     const now = Date.now();
     if (!tornClockSyncedAt || now - tornClockSyncedAt >= TORN_CLOCK_SYNC_INTERVAL_MS) syncTornClock();
     if (now - Number(state.api.lastAttackPoll || 0) >= desiredPollSeconds(state.api.attackPollSeconds) * 1000) pollAttacks();
@@ -1460,6 +1789,8 @@
       #${PANEL_ID} .upLine{display:flex;justify-content:center;align-items:baseline;gap:7px;flex-wrap:wrap;margin-top:4px}
       #${PANEL_ID} .upName{font-size:21px;font-weight:800;color:var(--s)} #${PANEL_ID} .hitBadge{font-size:12px;font-weight:700;color:var(--m)}
       #${PANEL_ID} .waitWarn{margin-top:5px;font-size:10px;color:#d39a36;font-weight:700}
+      #${PANEL_ID} .hitTempo{margin-top:7px;padding:6px 8px;border:1px solid var(--b);border-radius:6px;font-size:11px;font-weight:800;text-align:center}
+      #${PANEL_ID} .hitTempo.hold{color:var(--m)} #${PANEL_ID} .hitTempo.now{border-color:#5ca85c;color:var(--s);background:rgba(92,168,92,.14)}
       #${PANEL_ID} .nextGrid{display:grid;grid-template-columns:70px 1fr;gap:5px 8px;padding:8px 3px 2px}
       #${PANEL_ID} .nextPerson{display:flex;justify-content:space-between;gap:8px} #${PANEL_ID} .queueHit{color:var(--m);font-size:10px;white-space:nowrap}
       #${PANEL_ID} .controls{display:grid;grid-template-columns:1.5fr 1fr .8fr;gap:6px;margin-top:8px} #${PANEL_ID} .done{font-weight:800} #${PANEL_ID} .done.locked{opacity:.5}
@@ -1472,6 +1803,8 @@
       @keyframes hkmcqPulse{50%{opacity:.72}}
       #${PANEL_ID} .pending{margin-top:8px;padding:8px;border:1px solid #9b7a2e;border-radius:7px;background:var(--warn)} #${PANEL_ID} .pendingTitle{font-weight:800;margin-bottom:4px} #${PANEL_ID} .pendingText{font-size:11px;line-height:1.35}
       #${PANEL_ID} .pendingBtns{display:flex;gap:6px;margin-top:7px} #${PANEL_ID} .pendingBtns button{flex:1}
+      #${PANEL_ID} .pendingBulk{display:flex;gap:6px;margin-top:6px;padding-top:6px;border-top:1px solid rgba(127,127,127,.28)} #${PANEL_ID} .pendingBulk button{flex:1;font-size:10px}
+      #${PANEL_ID} .compactPending{width:100%;margin-top:7px;font-weight:800}
       #${PANEL_ID} .roster{margin-top:9px;max-height:245px;overflow:auto;border-top:1px solid var(--b)} #${PANEL_ID} .row{display:grid;grid-template-columns:28px minmax(0,1fr) 46px 58px 32px;gap:5px;align-items:center;padding:6px 0;border-bottom:1px solid var(--b)}
       #${PANEL_ID} .handle{height:32px;display:grid;place-items:center;color:var(--m);touch-action:none;cursor:grab} #${PANEL_ID} .row.dragging{opacity:.55} #${PANEL_ID} .row.dragover{outline:1px dashed var(--m)}
       #${PANEL_ID} .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} #${PANEL_ID} .name .assigned{font-size:10px;color:var(--m);margin-left:4px} #${PANEL_ID} .phits{text-align:right;font-size:10px;color:var(--m)}
@@ -1480,13 +1813,14 @@
       #${PANEL_ID} .sectionTitle{font-weight:800;margin-bottom:5px} #${PANEL_ID} .help{font-size:10px;color:var(--m);line-height:1.35;margin-top:4px} #${PANEL_ID} .miniRow{display:flex;gap:6px;margin-top:6px} #${PANEL_ID} .miniRow>*{flex:1}
       #${PANEL_ID} .settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:6px} #${PANEL_ID} .full{grid-column:1/-1} #${PANEL_ID} .checkRow{display:flex;gap:8px;align-items:center;font-size:11px} #${PANEL_ID} .checkRow input{width:auto}
       #${PANEL_ID} .apiStatusBox{margin-top:6px;padding:7px;border:1px solid var(--b);border-radius:6px;font-size:10px;line-height:1.45;color:var(--m)} #${PANEL_ID} .ledger{max-height:250px;overflow:auto;border:1px solid var(--b);border-radius:6px} #${PANEL_ID} .ledgerRow{display:grid;grid-template-columns:58px minmax(0,1fr) auto;gap:6px;padding:6px;border-bottom:1px solid var(--b);font-size:10px} #${PANEL_ID} .ledgerMeta{color:var(--m)}
+      #${PANEL_ID}.compactPanel{width:min(300px,calc(100vw - 12px));font-size:13px} #${PANEL_ID}.compactPanel .compactMain{padding:8px} #${PANEL_ID}.compactPanel .up{padding:8px 6px} #${PANEL_ID}.compactPanel .upName{font-size:19px} #${PANEL_ID}.compactPanel .nextGrid{padding:7px 2px 0}
       #${LAUNCHER_ID}{position:fixed;z-index:1000000;min-width:112px;min-height:42px;padding:0 11px;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid ${colors.border};border-radius:8px;background:${colors.panel2};color:${colors.text};box-shadow:0 6px 18px rgba(0,0,0,.35);font:800 11px Arial,Helvetica,sans-serif;cursor:grab;user-select:none;touch-action:none}
       #${LAUNCHER_ID}.danger{background:${colors.warn}} #${LAUNCHER_ID}.critical{background:${colors.danger};animation:hkmcqPulse 1s infinite} #${LAUNCHER_ID} .launcherDot{width:8px;height:8px;border-radius:50%;background:#777;flex:0 0 auto} #${LAUNCHER_ID}.active .launcherDot{background:#5ca85c} #${LAUNCHER_ID}.paused .launcherDot{background:#c9902f} #${LAUNCHER_ID}.pending .launcherDot{background:#c45b5b}
       #${LAUNCHER_ID} .launcherBadge{position:absolute;top:-7px;right:-7px;min-width:19px;height:19px;padding:0 5px;display:grid;place-items:center;border-radius:999px;background:#b33;color:#fff;font-size:10px;font-weight:800}
       #${LAUNCHER_ID} .launcherClose{width:26px;height:26px;margin-left:2px;display:grid;place-items:center;border-radius:5px;font-size:17px;line-height:1;font-weight:800;opacity:.72;cursor:pointer}
       #${LAUNCHER_ID} .launcherClose:hover{background:rgba(127,127,127,.18);opacity:1}
       #${TOAST_ID}{position:fixed;right:20px;bottom:22px;z-index:1000001;background:rgba(20,20,20,.95);color:#fff;border-radius:7px;padding:9px 12px;font:13px Arial,Helvetica,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)}
-      @media(max-width:600px){#${PANEL_ID}{width:calc(100vw - 8px);left:4px!important;right:auto!important;top:58px;border-radius:8px;font-size:14px}#${PANEL_ID} button{min-height:40px}#${PANEL_ID} .icon,#${PANEL_ID} .remove,#${PANEL_ID} .handle{width:40px;height:40px}#${PANEL_ID} .row{grid-template-columns:40px minmax(0,1fr) 42px 62px 40px}#${PANEL_ID} .roster{max-height:36vh}#${PANEL_ID} .controls{grid-template-columns:1.45fr 1fr 1fr}#${PANEL_ID} .upName{font-size:23px}#${LAUNCHER_ID}{min-height:46px;min-width:126px}}
+      @media(max-width:600px){#${PANEL_ID}{width:calc(100vw - 8px);left:4px!important;right:auto!important;top:58px;border-radius:8px;font-size:14px}#${PANEL_ID} button{min-height:40px}#${PANEL_ID} .icon,#${PANEL_ID} .remove,#${PANEL_ID} .handle{width:40px;height:40px}#${PANEL_ID} .row{grid-template-columns:40px minmax(0,1fr) 42px 62px 40px}#${PANEL_ID} .roster{max-height:36vh}#${PANEL_ID} .controls{grid-template-columns:1.45fr 1fr 1fr}#${PANEL_ID} .upName{font-size:23px}#${PANEL_ID}.compactPanel{width:min(300px,calc(100vw - 8px))!important;font-size:13px}#${PANEL_ID}.compactPanel .upName{font-size:20px}#${LAUNCHER_ID}{min-height:46px;min-width:126px}}
     `;
     document.head.appendChild(style);
   }
@@ -1530,13 +1864,13 @@
       state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
     }
     state.minimized = true;
-    saveNow();
+    saveLocalNow();
     renderApp();
   }
 
   function restoreApp() {
     state.minimized = false;
-    saveNow();
+    saveLocalNow();
     renderApp();
   }
 
@@ -1572,6 +1906,33 @@
     return `<div id="hkmcq-wait-warning" class="waitWarn">Waiting ${formatCountdown(seconds)} — consider SKIP if unavailable</div>`;
   }
 
+  function hitTempoState() {
+    if (!state.ui.hitTempoEnabled || state.api.mode === 'manual' || state.api.paused) return null;
+    const current = Number(state.api.chainCurrent);
+    if (!Number.isFinite(current) || current <= 0) return null;
+    if (current < 10) return { kind: 'now', text: 'HIT NOW • BUILD CHAIN' };
+
+    const remaining = remainingChainSeconds();
+    if (remaining == null) return null;
+    const threshold = clamp(Number(state.ui.hitTempoSeconds) || DEFAULT_HIT_TEMPO_SECONDS, 60, 300);
+    if (remaining <= threshold) {
+      return { kind: 'now', text: `HIT NOW • ${formatCountdown(remaining)} LEFT` };
+    }
+    return { kind: 'hold', text: `HOLD • ${formatCountdown(remaining)} LEFT • HIT AT ${formatCountdown(threshold)}` };
+  }
+
+  function hitTempoHtml() {
+    const tempo = hitTempoState();
+    if (!tempo) return '';
+    return `<div class="hitTempo ${tempo.kind}">${escapeHtml(tempo.text)}</div>`;
+  }
+
+  function compactPendingHtml() {
+    const count = state.api.pendingHits.length;
+    if (!count) return '';
+    return `<button class="compactPending" data-action="expand">⚠ ${count} PENDING HIT${count === 1 ? '' : 'S'} • REVIEW</button>`;
+  }
+
   function pendingHtml() {
     const pending = state.api.pendingHits[0];
     if (!pending) return '';
@@ -1590,6 +1951,7 @@
           <button data-action="confirmPending" data-add-unknown="${pending.kind === 'unknown' ? '1' : '0'}">${confirmLabel}</button>
           <button data-action="ignorePending">IGNORE</button>
         </div>
+        ${count > 1 ? `<div class="pendingBulk"><button data-action="recordAllPending">ADD / RECORD ALL (${count})</button><button data-action="ignoreAllPending">IGNORE ALL (${count})</button></div>` : ''}
       </div>`;
   }
 
@@ -1648,6 +2010,8 @@
         <label class="checkRow full"><input id="hkmcq-sound-alerts" type="checkbox" ${state.ui.soundAlerts ? 'checked' : ''}>One-time sound at chain danger thresholds</label>
         <label class="checkRow full"><input id="hkmcq-wait-warning" type="checkbox" ${state.ui.waitWarning ? 'checked' : ''}>Warn when the same player is UP too long</label>
         <label class="label full">Waiting warning (sec)<input id="hkmcq-wait-seconds" type="number" min="60" max="900" value="${state.ui.waitWarningSeconds}"></label>
+        <label class="checkRow full"><input id="hkmcq-hit-tempo" type="checkbox" ${state.ui.hitTempoEnabled ? 'checked' : ''}>Show HIT NOW chain-tempo guidance</label>
+        <label class="label full">HIT NOW threshold (sec, 60–300)<input id="hkmcq-hit-tempo-seconds" type="number" min="60" max="300" step="15" value="${state.ui.hitTempoSeconds}"></label>
       </div>
       <div class="miniRow"><button data-action="saveApi">SAVE SETTINGS</button><button data-action="testApi">TEST API</button></div>
       <div class="miniRow"><button data-action="clearApi" ${pdaKey ? 'disabled' : ''}>REMOVE SAVED KEY</button><button data-action="resumeApi" ${state.api.paused ? '' : 'disabled'}>RESUME API</button></div>
@@ -1656,6 +2020,7 @@
         Key: <strong>${pdaKey ? 'Torn PDA injected' : hasKey ? 'Saved' : 'Not saved'}</strong><br>
         Status: ${escapeHtml(state.api.status || '—')}
         ${state.api.lastError ? `<br><span style="color:#c66">${escapeHtml(state.api.lastError)}</span>` : ''}<br>
+        Tab API role: <strong>${tabApiRole()}</strong><br>
         Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}<br>
         Chain clock: ${formatCountdown(remainingChainSeconds())} | Last good sync: ${sync}
         ${backoff > 0 ? `<br>API backoff: ${backoff}s` : ''}
@@ -1705,35 +2070,63 @@
     }
     const ready = readyParticipants();
     const nums = hitNumbers();
+    const compact = IS_PDA && state.compact;
     const doneLocked = state.api.mode !== 'manual';
-    panel.innerHTML = `
-      <div class="head">
-        <div class="title">HKs Merc-C-Que<div class="sub">Chain Queue Organizer • v${VERSION} • ${IS_PDA ? 'PDA' : 'Desktop'}</div></div>
-        <button class="icon" data-action="setup" title="Roster / message / API setup">⚙</button>
-        <button class="icon" data-action="minimize" title="Minimize Merc-C-Que">—</button>
-      </div>
-      <div class="main">
-        <div class="up">
-          <div class="kicker">UP NOW</div>
-          <div class="upLine"><span id="hkmcq-up-name" class="upName">${escapeHtml(ready[0]?.name || 'No READY participant')}</span><span id="hkmcq-hit-badge" class="hitBadge">• HIT #${nums.hit}</span></div>
-          <div id="hkmcq-wait-slot">${waitWarningHtml()}</div>
+    panel.className = compact ? 'compactPanel' : '';
+
+    if (compact) {
+      panel.innerHTML = `
+        <div class="head">
+          <div class="title">HKs Merc-C-Que<div class="sub">COMPACT • v${VERSION}</div></div>
+          <button class="icon" data-action="expand" title="Open full Merc-C-Que">□</button>
+          <button class="icon" data-action="minimize" title="Minimize Merc-C-Que">—</button>
         </div>
-        <div class="nextGrid">
-          <div class="label">NEXT</div><div class="nextPerson"><span id="hkmcq-next-name">${escapeHtml(ready[1]?.name || '—')}</span><span id="hkmcq-next-hit" class="queueHit">HIT #${nums.nextHit}</span></div>
-          <div class="label">ON DECK</div><div class="nextPerson"><span id="hkmcq-ondeck-name">${escapeHtml(ready[2]?.name || '—')}</span><span id="hkmcq-ondeck-hit" class="queueHit">HIT #${nums.onDeckHit}</span></div>
+        <div class="compactMain">
+          <div class="up">
+            <div class="kicker">UP NOW</div>
+            <div class="upLine"><span id="hkmcq-up-name" class="upName">${escapeHtml(ready[0]?.name || 'No READY participant')}</span><span id="hkmcq-hit-badge" class="hitBadge">• HIT #${nums.hit}</span></div>
+            <div id="hkmcq-tempo-slot">${hitTempoHtml()}</div>
+            <div id="hkmcq-wait-slot">${waitWarningHtml()}</div>
+          </div>
+          <div class="nextGrid">
+            <div class="label">NEXT</div><div class="nextPerson"><span id="hkmcq-next-name">${escapeHtml(ready[1]?.name || '—')}</span><span id="hkmcq-next-hit" class="queueHit">HIT #${nums.nextHit}</span></div>
+            <div class="label">ON DECK</div><div class="nextPerson"><span id="hkmcq-ondeck-name">${escapeHtml(ready[2]?.name || '—')}</span><span id="hkmcq-ondeck-hit" class="queueHit">HIT #${nums.onDeckHit}</span></div>
+          </div>
+          <div id="hkmcq-pending-slot">${compactPendingHtml()}</div>
+          <div id="hkmcq-api-strip-slot">${apiStripHtml()}</div>
+        </div>`;
+    } else {
+      panel.innerHTML = `
+        <div class="head">
+          <div class="title">HKs Merc-C-Que<div class="sub">Chain Queue Organizer • v${VERSION} • ${IS_PDA ? 'PDA' : 'Desktop'}</div></div>
+          <button class="icon" data-action="setup" title="Roster / message / API setup">⚙</button>
+          ${IS_PDA ? '<button class="icon" data-action="compact" title="Compact PDA view">▣</button>' : ''}
+          <button class="icon" data-action="minimize" title="Minimize Merc-C-Que">—</button>
         </div>
-        <div id="hkmcq-pending-slot">${pendingHtml()}</div>
-        <div class="controls">
-          <button id="hkmcq-done" class="done ${doneLocked ? 'locked' : ''}" data-action="done">✓ ${doneLocked ? 'API ACTIVE' : 'DONE'}</button>
-          <button data-action="skip">SKIP</button><button data-action="undo">↶ UNDO</button>
-        </div>
-        <div class="hitRow"><span class="label">HIT</span><input id="hkmcq-hit-number" type="number" min="1" step="1" value="${nums.hit}" ${state.api.mode !== 'manual' ? 'disabled' : ''}><span id="hkmcq-ready-count" class="label">${ready.length}/${state.roster.length} ready</span></div>
-        <div id="hkmcq-api-strip-slot">${apiStripHtml()}</div>
-        <div id="hkmcq-preview" class="preview">${escapeHtml(buildMessage())}</div>
-        <button class="copy" data-action="copy">COPY MESSAGE</button>
-        <div id="hkmcq-roster" class="roster">${rosterRowsHtml()}</div>
-        <div id="hkmcq-settings-shell-slot">${settingsShellHtml()}</div>
-      </div>`;
+        <div class="main">
+          <div class="up">
+            <div class="kicker">UP NOW</div>
+            <div class="upLine"><span id="hkmcq-up-name" class="upName">${escapeHtml(ready[0]?.name || 'No READY participant')}</span><span id="hkmcq-hit-badge" class="hitBadge">• HIT #${nums.hit}</span></div>
+            <div id="hkmcq-tempo-slot">${hitTempoHtml()}</div>
+            <div id="hkmcq-wait-slot">${waitWarningHtml()}</div>
+          </div>
+          <div class="nextGrid">
+            <div class="label">NEXT</div><div class="nextPerson"><span id="hkmcq-next-name">${escapeHtml(ready[1]?.name || '—')}</span><span id="hkmcq-next-hit" class="queueHit">HIT #${nums.nextHit}</span></div>
+            <div class="label">ON DECK</div><div class="nextPerson"><span id="hkmcq-ondeck-name">${escapeHtml(ready[2]?.name || '—')}</span><span id="hkmcq-ondeck-hit" class="queueHit">HIT #${nums.onDeckHit}</span></div>
+          </div>
+          <div id="hkmcq-pending-slot">${pendingHtml()}</div>
+          <div class="controls">
+            <button id="hkmcq-done" class="done ${doneLocked ? 'locked' : ''}" data-action="done">✓ ${doneLocked ? 'API ACTIVE' : 'DONE'}</button>
+            <button data-action="skip">SKIP</button><button data-action="undo">↶ UNDO</button>
+          </div>
+          <div class="hitRow"><span class="label">HIT</span><input id="hkmcq-hit-number" type="number" min="1" step="1" value="${nums.hit}" ${state.api.mode !== 'manual' ? 'disabled' : ''}><span id="hkmcq-ready-count" class="label">${ready.length}/${state.roster.length} ready</span></div>
+          <div id="hkmcq-api-strip-slot">${apiStripHtml()}</div>
+          <div id="hkmcq-preview" class="preview">${escapeHtml(buildMessage())}</div>
+          <button class="copy" data-action="copy">COPY MESSAGE</button>
+          <div id="hkmcq-roster" class="roster">${rosterRowsHtml()}</div>
+          <div id="hkmcq-settings-shell-slot">${settingsShellHtml()}</div>
+        </div>`;
+    }
     applyPanelPosition(panel);
     bindPanel(panel);
     requestAnimationFrame(adjustPanelViewport);
@@ -1781,7 +2174,8 @@
       doneButton.textContent = `✓ ${locked ? 'API ACTIVE' : 'DONE'}`;
     }
     setHtml(panel.querySelector('#hkmcq-api-strip-slot'), apiStripHtml());
-    setHtml(panel.querySelector('#hkmcq-pending-slot'), pendingHtml());
+    setHtml(panel.querySelector('#hkmcq-pending-slot'), IS_PDA && state.compact ? compactPendingHtml() : pendingHtml());
+    setHtml(panel.querySelector('#hkmcq-tempo-slot'), hitTempoHtml());
     setHtml(panel.querySelector('#hkmcq-wait-slot'), waitWarningHtml());
     const preview = panel.querySelector('#hkmcq-preview');
     if (preview) preview.textContent = buildMessage();
@@ -1800,6 +2194,7 @@
     const remaining = remainingChainSeconds();
     const clock = panel.querySelector('#hkmcq-chain-clock');
     if (clock) clock.textContent = formatCountdown(remaining);
+    setHtml(panel.querySelector('#hkmcq-tempo-slot'), hitTempoHtml());
     setHtml(panel.querySelector('#hkmcq-wait-slot'), waitWarningHtml());
     const strip = panel.querySelector('.apiStrip');
     if (strip) {
@@ -1809,14 +2204,16 @@
     }
   }
 
-  function updateApiStatusBox() {
+  function updateApiStatusBox(roleOverride = null) {
     const box = document.querySelector('#hkmcq-api-status');
     if (!box) return;
     const last = state.api.lastHit ? `${state.api.lastHit.attacker} at #${state.api.lastHit.chain}` : '—';
+    const apiRole = roleOverride || tabApiRole();
     box.innerHTML =
       `Platform: <strong>${platformLabel()}</strong>` +
       `<br>Key: <strong>${PDA_INJECTED_KEY ? 'Torn PDA injected' : hasApiKey() ? 'Saved' : 'Not saved'}</strong>` +
       `<br>Status: ${escapeHtml(state.api.status || '—')}` +
+      `<br>Tab API role: <strong>${apiRole}</strong>` +
       `<br>Current chain: ${state.api.chainCurrent ?? '—'} | Next hit: ${nextHitNumber()}` +
       `<br>Chain clock: ${formatCountdown(remainingChainSeconds())}` +
       `<br>Last detected: ${escapeHtml(last)}` +
@@ -1946,6 +2343,14 @@
       case 'resumeApi': resumeApi(); break;
       case 'confirmPending': confirmPendingHit(element.dataset.addUnknown === '1'); break;
       case 'ignorePending': ignorePendingHit(); break;
+      case 'recordAllPending': recordAllPendingHits(); break;
+      case 'ignoreAllPending': ignoreAllPendingHits(); break;
+      case 'compact':
+        if (IS_PDA) { state.compact = true; saveLocalNow(); renderApp(); }
+        break;
+      case 'expand':
+        state.compact = false; saveLocalNow(); renderApp();
+        break;
       case 'minimize': minimizeApp(); break;
       case 'setup':
         state.setupOpen = !state.setupOpen;
@@ -1961,7 +2366,7 @@
   }
 
   function rerenderSettings() {
-    saveNow();
+    saveLocalNow();
     renderSettings();
     requestAnimationFrame(adjustPanelViewport);
   }
@@ -2110,7 +2515,7 @@
       if (panel) {
         const rect = panel.getBoundingClientRect();
         state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
-        saveNow();
+        saveLocalNow();
         adjustPanelViewport();
       }
       panelDrag = null;
@@ -2120,7 +2525,7 @@
       if (launcher) {
         const rect = launcher.getBoundingClientRect();
         state.launcherPosition = { left: Math.round(rect.left), top: Math.round(rect.top) };
-        saveNow();
+        saveLocalNow();
       }
       if (launcherDrag.moved) suppressLauncherClickUntil = Date.now() + 250;
       launcherDrag = null;
@@ -2160,7 +2565,7 @@
       setPosition(launcher, position);
       state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
     }
-    saveSoon();
+    saveLocalSoon();
   });
 
   function toast(message) {
@@ -2190,14 +2595,16 @@
 
   window.addEventListener('pagehide', () => {
     // Flush any debounced save; saveNow() also persists PDA UI state.
-    if (saveTimer) saveNow();
+    if (saveTimer) saveNow({ sync: saveTimerSync });
     else persistPdaUiState();
+    releaseApiLeadership();
   });
 
   document.addEventListener('visibilitychange', () => {
     const now = Date.now();
     const gap = now - lastVisibilityChangeAt;
     lastVisibilityChangeAt = now;
+    if (automationActive()) maintainApiLeadership({ forceRenew: true });
     if (document.hidden) persistPdaUiState();
     if (!document.hidden && gap >= 15000) {
       reconcileAfterResume(IS_PDA ? 'Torn PDA resume' : 'tab resume');
@@ -2213,12 +2620,13 @@
     if (event.persisted && automationActive()) reconcileAfterResume('page restore');
   });
 
+  initTabSync();
   trackUpTimer();
   renderApp();
   setInterval(ensureMounted, 2500);
   startScheduler();
 
-  if (automationActive()) {
+  if (automationActive() && maintainApiLeadership()) {
     resetPollTimers();
     if (!state.api.baselineReady) pollAttacks({ forceBaseline: true });
     syncTornClock({ force: true }).finally(() => pollChain());
