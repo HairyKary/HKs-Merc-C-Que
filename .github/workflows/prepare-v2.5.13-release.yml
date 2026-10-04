@@ -1,0 +1,43 @@
+name: Prepare v2.5.13 release
+
+on:
+  push:
+    branches:
+      - v2.5.13-pda-tempo-bulk
+    paths:
+      - .github/workflows/prepare-v2.5.13-release.yml
+      - .github/scripts/prepare-v2.5.13-release.py
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v2.5.13-pda-tempo-bulk
+      - name: Apply release preparation patch
+        run: python3 .github/scripts/prepare-v2.5.13-release.py
+      - name: Verify release candidate
+        run: |
+          node --check HKs-Merc-C-Que.user.js
+          git diff --check
+          grep -q "const MAX_PENDING = 200;" HKs-Merc-C-Que.user.js
+          grep -q "@version      2.5.13" HKs-Merc-C-Que.user.js
+          test "$(grep -c 'raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js' HKs-Merc-C-Que.user.js)" -eq 2
+          grep -q "Current version:\*\* v2.5.13" README.md
+          grep -q "## \[2.5.13\] - Release" CHANGELOG.md
+          grep -q "Current release: v2.5.13" USERSCRIPT-METADATA.txt
+          if git diff --quiet; then
+            echo 'No release-prep changes were produced.' >&2
+            exit 1
+          fi
+      - name: Commit release candidate
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HKs-Merc-C-Que.user.js README.md CHANGELOG.md USERSCRIPT-METADATA.txt
+          git commit -m 'Prepare v2.5.13 release candidate'
+          git push origin v2.5.13-pda-tempo-bulk
