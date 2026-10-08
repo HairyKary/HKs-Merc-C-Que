@@ -163,7 +163,12 @@
   let saveTimer = null;
   let saveTimerSync = false;
   let pdaUiSaveChain = Promise.resolve();
-  let lastPdaUiSnapshotJson = '';
+  let lastPdaUiSnapshotJson = PDA_STORAGE ? JSON.stringify({
+    minimized: state.minimized === true,
+    compact: state.compact === true,
+    launcherPosition: normalizeStoredPosition(state.launcherPosition),
+    panelPosition: normalizeStoredPosition(state.position)
+  }) : '';
   let attackInFlight = false;
   let chainInFlight = false;
   let reconciliationInFlight = false;
@@ -662,6 +667,15 @@
     return true;
   }
 
+  function applyStoredSharedState() {
+    try {
+      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
+      return raw ? applySharedEnvelope(JSON.parse(raw)) : false;
+    } catch {
+      return false;
+    }
+  }
+
   function initTabSync() {
     try {
       if (typeof BroadcastChannel === 'function') {
@@ -680,12 +694,7 @@
       try { applySharedEnvelope(JSON.parse(event.newValue)); } catch {}
     });
 
-    let existing = null;
-    try {
-      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
-      if (raw) existing = JSON.parse(raw);
-    } catch {}
-    if (!applySharedEnvelope(existing)) publishSharedState(true);
+    if (!applyStoredSharedState()) publishSharedState(true);
   }
 
   function readApiLeaderLease() {
@@ -860,14 +869,18 @@
     state.roster = previous.roster;
     state.manualNextHit = previous.manualNextHit;
     if (Array.isArray(previous.ledger)) state.ledger = previous.ledger;
-    if (previous.meta?.attackId) {
-      const existing = state.ledger.find(x => String(x.id) === String(previous.meta.attackId));
+    const undoLedgerIds = new Set([
+      previous.meta?.attackId,
+      ...(Array.isArray(previous.meta?.ledgerIds) ? previous.meta.ledgerIds : [])
+    ].filter(Boolean).map(String));
+    for (const ledgerId of undoLedgerIds) {
+      const existing = state.ledger.find(x => String(x.id) === ledgerId);
       if (existing) {
         existing.undone = true;
         existing.action = 'undone';
-      } else {
+      } else if (String(previous.meta?.attackId || '') === ledgerId) {
         state.ledger.unshift({
-          id: String(previous.meta.attackId),
+          id: ledgerId,
           attacker: String(previous.meta.attacker || 'Unknown'),
           chain: Number(previous.meta.chain) || 0,
           kind: String(previous.meta.kind || 'expected'),
@@ -944,11 +957,12 @@
     if (state.api.mode !== 'manual') return toast('Switch API Mode to Manual before using DONE.');
     const index = currentIndex();
     if (index < 0) return toast('No READY participant.');
-    pushHistory('manual DONE', {}, { captureLedger: true });
+    const ledgerId = `manual-${Date.now()}`;
+    pushHistory('manual DONE', { ledgerIds: [ledgerId] });
     const participant = sendToBack(index, true);
     state.manualNextHit = nextHitNumber() + 1;
     addLedger({
-      id: `manual-${Date.now()}`, attacker: participant.name,
+      id: ledgerId, attacker: participant.name,
       chain: state.manualNextHit - 1, kind: 'manual',
       expected: true, mode: 'manual', action: 'manual-recorded'
     });
@@ -1552,6 +1566,7 @@
   async function reconcileAfterResume(reason = 'resume') {
     if (reconciliationInFlight || !automationActive()) return;
     if (!maintainApiLeadership()) {
+      applyStoredSharedState();
       refresh({ settings: true });
       return;
     }
@@ -1714,7 +1729,9 @@
       (Number(a.chain) - Number(b.chain)) ||
       String(a.id).localeCompare(String(b.id))
     );
-    pushHistory(`record all ${count} pending hits`, {}, { captureLedger: true });
+    pushHistory(`record all ${count} pending hits`, {
+      ledgerIds: pending.map(event => String(event.id))
+    });
 
     let added = 0;
     for (const event of pending) {
