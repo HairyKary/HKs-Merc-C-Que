@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.13
+// @version      2.5.14
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -15,14 +15,14 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.14-optimization/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.14-optimization/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.13';
+  const VERSION = '2.5.14';
   const SCHEMA_VERSION = 6;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -163,6 +163,7 @@
   let saveTimer = null;
   let saveTimerSync = false;
   let pdaUiSaveChain = Promise.resolve();
+  let lastPdaUiSnapshotJson = '';
   let attackInFlight = false;
   let chainInFlight = false;
   let reconciliationInFlight = false;
@@ -190,6 +191,7 @@
   let sharedSequence = 0;
   let lastSharedStamp = { updatedAt: 0, sourceId: '', sequence: 0 };
   let lastPublishedSharedJson = '';
+  let lastPublishedSectionJson = {};
   let lastLeaderRenewAt = 0;
   let wasApiLeader = false;
   let lastReportedTabRole = '';
@@ -256,16 +258,25 @@
       launcherPosition: normalizeStoredPosition(state.launcherPosition),
       panelPosition: normalizeStoredPosition(state.position)
     };
+    const snapshotJson = JSON.stringify(snapshot);
+    if (snapshotJson === lastPdaUiSnapshotJson) return;
+    lastPdaUiSnapshotJson = snapshotJson;
+
     pdaUiSaveChain = pdaUiSaveChain
       .catch(() => {})
       .then(async () => {
-        await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized);
-        await pdaStorageSet(PDA_COMPACT_STORE, snapshot.compact);
+        const writes = [
+          await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized),
+          await pdaStorageSet(PDA_COMPACT_STORE, snapshot.compact)
+        ];
         if (snapshot.launcherPosition) {
-          await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition));
+          writes.push(await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition)));
         }
         if (snapshot.panelPosition) {
-          await pdaStorageSet(PDA_PANEL_POSITION_STORE, JSON.stringify(snapshot.panelPosition));
+          writes.push(await pdaStorageSet(PDA_PANEL_POSITION_STORE, JSON.stringify(snapshot.panelPosition)));
+        }
+        if (writes.some(ok => !ok) && lastPdaUiSnapshotJson === snapshotJson) {
+          lastPdaUiSnapshotJson = '';
         }
       });
   }
@@ -497,6 +508,32 @@
     };
   }
 
+  const SHARED_SECTION_KEYS = [
+    'schemaVersion', 'roster', 'manualNextHit', 'template',
+    'ui', 'ledger', 'api', 'history', 'runtime'
+  ];
+
+  function sharedSectionJson(snapshot) {
+    const sections = {};
+    for (const key of SHARED_SECTION_KEYS) sections[key] = JSON.stringify(snapshot?.[key]);
+    return sections;
+  }
+
+  function rememberPublishedSnapshot(snapshot) {
+    lastPublishedSectionJson = sharedSectionJson(snapshot);
+  }
+
+  function buildSharedDelta(snapshot, force = false) {
+    const nextSections = sharedSectionJson(snapshot);
+    const delta = {};
+    for (const key of SHARED_SECTION_KEYS) {
+      if (force || nextSections[key] !== lastPublishedSectionJson[key]) {
+        delta[key] = snapshot[key];
+      }
+    }
+    return delta;
+  }
+
   function sharedStampIsNewer(envelope) {
     const updatedAt = Number(envelope?.updatedAt) || 0;
     const sourceId = String(envelope?.sourceId || '');
@@ -536,26 +573,36 @@
     const snapshotJson = JSON.stringify(snapshot);
     if (!force && snapshotJson === lastPublishedSharedJson) return;
 
-    const envelope = {
-      type: 'state',
+    const stamp = {
       sourceId: TAB_ID,
       updatedAt: Date.now(),
-      sequence: ++sharedSequence,
-      snapshot
+      sequence: ++sharedSequence
     };
-    lastPublishedSharedJson = snapshotJson;
-    recordSharedStamp(envelope);
+    const fullEnvelope = { type: 'state', ...stamp, snapshot };
+    const delta = buildSharedDelta(snapshot, force || !lastPublishedSharedJson);
+    const broadcastEnvelope = force || !lastPublishedSharedJson
+      ? fullEnvelope
+      : { type: 'state-delta', ...stamp, snapshot: delta };
 
-    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(envelope)); }
+    lastPublishedSharedJson = snapshotJson;
+    rememberPublishedSnapshot(snapshot);
+    recordSharedStamp(fullEnvelope);
+
+    // Keep one full snapshot in storage for new tabs and as the no-BroadcastChannel fallback.
+    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(fullEnvelope)); }
     catch (error) { console.warn('[Merc-C-Que] Shared-state save failed:', error); }
-    try { syncChannel?.postMessage(envelope); } catch {}
+
+    // Active tabs normally receive only the sections that changed.
+    try { syncChannel?.postMessage(broadcastEnvelope); } catch {}
   }
 
   function applySharedEnvelope(envelope) {
-    if (!envelope || envelope.type !== 'state' || envelope.sourceId === TAB_ID) return false;
+    if (!envelope || !['state', 'state-delta'].includes(envelope.type) || envelope.sourceId === TAB_ID) return false;
     if (!sharedStampIsNewer(envelope)) return false;
     const shared = envelope.snapshot;
     if (!shared || typeof shared !== 'object') return false;
+    const isDelta = envelope.type === 'state-delta';
+    const has = key => !isDelta || Object.prototype.hasOwnProperty.call(shared, key);
 
     const rosterBefore = JSON.stringify(state.roster);
     const templateBefore = state.template;
@@ -565,27 +612,36 @@
     const lastAttackPoll = state.api.lastAttackPoll;
     const lastChainPoll = state.api.lastChainPoll;
 
-    state.roster = Array.isArray(shared.roster) ? shared.roster.map(normalizeParticipant) : state.roster;
-    state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
-    state.template = typeof shared.template === 'string' ? shared.template : state.template;
-    state.ui = { ...state.ui, ...(shared.ui || {}) };
-    state.ledger = normalizeLedger(shared.ledger);
-    state.api = normalizeApi({
-      ...state.api,
-      ...(shared.api || {}),
-      lastAttackPoll,
-      lastChainPoll
-    });
-    history = Array.isArray(shared.history) ? shared.history.slice(-MAX_HISTORY) : history;
+    if (has('schemaVersion')) state.schemaVersion = Number(shared.schemaVersion) || state.schemaVersion;
+    if (has('roster') && Array.isArray(shared.roster)) {
+      state.roster = shared.roster.map(normalizeParticipant);
+    }
+    if (has('manualNextHit')) state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
+    if (has('template') && typeof shared.template === 'string') state.template = shared.template;
+    if (has('ui')) state.ui = { ...state.ui, ...(shared.ui || {}) };
+    if (has('ledger')) state.ledger = normalizeLedger(shared.ledger);
+    if (has('api')) {
+      state.api = normalizeApi({
+        ...state.api,
+        ...(shared.api || {}),
+        lastAttackPoll,
+        lastChainPoll
+      });
+    }
+    if (has('history') && Array.isArray(shared.history)) {
+      history = shared.history.slice(-MAX_HISTORY);
+    }
 
-    const runtime = shared.runtime || {};
-    lastUpName = String(runtime.lastUpName || '');
-    upSince = Number(runtime.upSince) || Date.now();
-    tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
-    tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
-    chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
-    dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
-    criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+    if (has('runtime')) {
+      const runtime = shared.runtime || {};
+      lastUpName = String(runtime.lastUpName || '');
+      upSince = Number(runtime.upSince) || Date.now();
+      tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
+      tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
+      chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
+      dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
+      criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+    }
 
     const rosterChanged = JSON.stringify(state.roster) !== rosterBefore;
     const templateChanged = state.template !== templateBefore;
@@ -599,7 +655,9 @@
     );
 
     recordSharedStamp(envelope);
-    lastPublishedSharedJson = JSON.stringify(buildSharedSnapshot());
+    const currentSnapshot = buildSharedSnapshot();
+    lastPublishedSharedJson = JSON.stringify(currentSnapshot);
+    rememberPublishedSnapshot(currentSnapshot);
     refresh({ roster: rosterChanged, settings: settingsChanged });
     return true;
   }
@@ -617,6 +675,8 @@
 
     window.addEventListener('storage', event => {
       if (event.key !== TAB_SHARED_STATE_STORE || !event.newValue) return;
+      // BroadcastChannel is the lighter primary path. Storage remains the fallback/bootstrap snapshot.
+      if (syncChannel) return;
       try { applySharedEnvelope(JSON.parse(event.newValue)); } catch {}
     });
 
@@ -782,11 +842,15 @@
     return !!getEffectiveApiKey();
   }
 
-  function pushHistory(reason = 'queue change', meta = {}) {
-    history.push({
-      reason, meta: clone(meta), roster: clone(state.roster),
-      manualNextHit: state.manualNextHit, ledger: clone(state.ledger)
-    });
+  function pushHistory(reason = 'queue change', meta = {}, { captureLedger = false } = {}) {
+    const entry = {
+      reason,
+      meta: clone(meta),
+      roster: clone(state.roster),
+      manualNextHit: state.manualNextHit
+    };
+    if (captureLedger) entry.ledger = clone(state.ledger);
+    history.push(entry);
     if (history.length > MAX_HISTORY) history.shift();
   }
 
@@ -795,7 +859,7 @@
     const previous = history.pop();
     state.roster = previous.roster;
     state.manualNextHit = previous.manualNextHit;
-    state.ledger = previous.ledger;
+    if (Array.isArray(previous.ledger)) state.ledger = previous.ledger;
     if (previous.meta?.attackId) {
       const existing = state.ledger.find(x => String(x.id) === String(previous.meta.attackId));
       if (existing) {
@@ -880,7 +944,7 @@
     if (state.api.mode !== 'manual') return toast('Switch API Mode to Manual before using DONE.');
     const index = currentIndex();
     if (index < 0) return toast('No READY participant.');
-    pushHistory('manual DONE');
+    pushHistory('manual DONE', {}, { captureLedger: true });
     const participant = sendToBack(index, true);
     state.manualNextHit = nextHitNumber() + 1;
     addLedger({
@@ -964,7 +1028,7 @@
 
   function resetSession() {
     if (!confirm('Reset player hit counts, manual hit number, API pending notices, and set everyone READY? Roster order will stay the same.')) return;
-    pushHistory('reset session');
+    pushHistory('reset session', {}, { captureLedger: true });
     state.roster.forEach(p => { p.hits = 0; p.status = 'ready'; });
     state.manualNextHit = 1;
     state.api.pendingHits = [];
@@ -1200,9 +1264,10 @@
   }
 
   function addPendingHit(event) {
-    if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return;
+    if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return true;
+    if (state.api.pendingHits.length >= MAX_PENDING) return false;
     state.api.pendingHits.push(event);
-    state.api.pendingHits = state.api.pendingHits.slice(0, MAX_PENDING);
+    return true;
   }
 
   const hasSyncError = () =>
@@ -1308,7 +1373,15 @@
       state.api.status = `AUTO: ${attacker} recorded at #${chain}`;
       return true;
     }
-    addPendingHit(event);
+    if (!addPendingHit(event)) {
+      updateLedgerAction(id, 'pending-capacity-paused');
+      state.api.paused = true;
+      state.api.status = `Pending backlog reached ${MAX_PENDING} — automation paused before dropping a hit`;
+      state.api.reconciliationNote =
+        `Pending capacity reached before hit #${chain} by ${attacker}. Clear the backlog, then RESUME API to reconcile safely.`;
+      toast(`Pending backlog reached ${MAX_PENDING}. API automation paused before losing a hit.`);
+      return 'pending-full';
+    }
     updateLedgerAction(id, 'pending');
     if (index < 0) state.api.status = `Hit #${chain}: ${attacker} is not in the queue`;
     else if (expected) state.api.status = `Hit #${chain} detected — awaiting confirmation`;
@@ -1357,12 +1430,17 @@
 
       let changed = false;
       for (const { attack, id } of fresh) {
+        const result = processDetectedAttack(attack);
+        if (result === 'pending-full') {
+          changed = true;
+          break;
+        }
         markProcessed(id);
-        if (processDetectedAttack(attack)) changed = true;
+        if (result) changed = true;
       }
 
       if (!fresh.length) state.api.status = 'Connected — watching new faction hits';
-      if (reconciliation) {
+      if (reconciliation && !state.api.paused) {
         state.api.reconciliationNote = fresh.length
           ? `Reconciled ${fresh.length} new attack${fresh.length === 1 ? '' : 's'} after resume.`
           : 'Resume reconciliation complete — no missed attacks found.';
@@ -1636,7 +1714,7 @@
       (Number(a.chain) - Number(b.chain)) ||
       String(a.id).localeCompare(String(b.id))
     );
-    pushHistory(`record all ${count} pending hits`);
+    pushHistory(`record all ${count} pending hits`, {}, { captureLedger: true });
 
     let added = 0;
     for (const event of pending) {
