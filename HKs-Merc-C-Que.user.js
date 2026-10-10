@@ -15,8 +15,8 @@
 // @noframes
 // @homepageURL  https://github.com/HairyKary/HKs-Merc-C-Que
 // @supportURL   https://github.com/HairyKary/HKs-Merc-C-Que/issues
-// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.14-optimization/HKs-Merc-C-Que.user.js
-// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/v2.5.14-optimization/HKs-Merc-C-Que.user.js
+// @updateURL    https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
+// @downloadURL  https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js
 // ==/UserScript==
 
 (async () => {
