@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.5.14] - Release
+
+### Performance / state handling
+- Reduced Undo history size by storing only the queue state and affected ledger IDs for normal actions
+- Full ledger snapshots are now reserved for operations such as RESET SESSION that actually require complete ledger restoration
+- Added change-aware Torn PDA UI persistence so routine API/queue updates do not rewrite unchanged panel, launcher, minimized, or compact state
+- Added lighter BroadcastChannel updates that send only changed state sections while retaining a full local snapshot for bootstrap and fallback recovery
+
+### Pending backlog reliability
+- Kept the 200-event pending-hit capacity
+- If the pending queue is full, Merc-C-Que now pauses API automation before marking the next hit processed instead of silently dropping it
+- After the backlog is cleared, RESUME API can reconcile the unprocessed hit from Torn
+
+### Position persistence
+- Panel and minimized launcher positions now remember the nearest horizontal screen edge and the gap from that edge
+- Resizing the browser keeps Merc-C-Que attached to the side where it was placed instead of leaving it at an old absolute pixel coordinate
+- Existing saved left/top positions are upgraded automatically when loaded
+
+### Validation
+- JavaScript syntax validation passed
+- v2.5.14 branch remained based directly on the released v2.5.13 main branch with only the intended userscript and release-document changes
+
 ## [2.5.13] - Release
 
 ### Multi-tab war synchronization

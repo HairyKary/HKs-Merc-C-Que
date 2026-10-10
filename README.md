@@ -5,7 +5,7 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Release  
-> **Current version:** v2.5.13
+> **Current version:** v2.5.14
 > Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
 
@@ -50,6 +50,10 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Optional configurable HIT NOW chain-tempo guidance
 - Bulk **ADD / RECORD ALL** and **IGNORE ALL** actions for pending-hit backlogs
 - Pending-hit queue capacity increased to 200 events
+- Leaner Undo history and lighter same-browser tab synchronization
+- Change-aware Torn PDA UI storage to reduce redundant writes
+- Safe pending-backlog overflow protection that pauses before a hit can be dropped
+- Edge-anchored panel and launcher positions that remain attached to the chosen side when the browser is resized
 - Optional warning when the same player remains UP too long
 
 ## Installation

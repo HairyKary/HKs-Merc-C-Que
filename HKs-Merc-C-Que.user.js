@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HKs Merc-C-Que
 // @namespace    hks-merc-c-que
-// @version      2.5.13
+// @version      2.5.14
 // @description  Torn faction chain queue organizer with unified Desktop and Torn PDA support.
 // @author       HairyKary
 // @match        https://www.torn.com/*
@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '2.5.13';
+  const VERSION = '2.5.14';
   const SCHEMA_VERSION = 6;
   const STORAGE_KEY = 'hksMercCQue_v2';
   const LEGACY_KEY = 'tornChainQueue_v1';
@@ -163,6 +163,12 @@
   let saveTimer = null;
   let saveTimerSync = false;
   let pdaUiSaveChain = Promise.resolve();
+  let lastPdaUiSnapshotJson = PDA_STORAGE ? JSON.stringify({
+    minimized: state.minimized === true,
+    compact: state.compact === true,
+    launcherPosition: normalizeStoredPosition(state.launcherPosition),
+    panelPosition: normalizeStoredPosition(state.position)
+  }) : '';
   let attackInFlight = false;
   let chainInFlight = false;
   let reconciliationInFlight = false;
@@ -190,6 +196,7 @@
   let sharedSequence = 0;
   let lastSharedStamp = { updatedAt: 0, sourceId: '', sequence: 0 };
   let lastPublishedSharedJson = '';
+  let lastPublishedSectionJson = {};
   let lastLeaderRenewAt = 0;
   let wasApiLeader = false;
   let lastReportedTabRole = '';
@@ -206,7 +213,14 @@
       const left = Number(parsed?.left);
       const top = Number(parsed?.top);
       if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
-      return { left: Math.round(left), top: Math.round(top) };
+      const position = { left: Math.round(left), top: Math.round(top) };
+      const anchorX = parsed?.anchorX;
+      const offsetX = Number(parsed?.offsetX);
+      if ((anchorX === 'left' || anchorX === 'right') && Number.isFinite(offsetX)) {
+        position.anchorX = anchorX;
+        position.offsetX = Math.max(0, Math.round(offsetX));
+      }
+      return position;
     } catch {
       return null;
     }
@@ -256,16 +270,25 @@
       launcherPosition: normalizeStoredPosition(state.launcherPosition),
       panelPosition: normalizeStoredPosition(state.position)
     };
+    const snapshotJson = JSON.stringify(snapshot);
+    if (snapshotJson === lastPdaUiSnapshotJson) return;
+    lastPdaUiSnapshotJson = snapshotJson;
+
     pdaUiSaveChain = pdaUiSaveChain
       .catch(() => {})
       .then(async () => {
-        await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized);
-        await pdaStorageSet(PDA_COMPACT_STORE, snapshot.compact);
+        const writes = [
+          await pdaStorageSet(PDA_MINIMIZED_STORE, snapshot.minimized),
+          await pdaStorageSet(PDA_COMPACT_STORE, snapshot.compact)
+        ];
         if (snapshot.launcherPosition) {
-          await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition));
+          writes.push(await pdaStorageSet(PDA_LAUNCHER_POSITION_STORE, JSON.stringify(snapshot.launcherPosition)));
         }
         if (snapshot.panelPosition) {
-          await pdaStorageSet(PDA_PANEL_POSITION_STORE, JSON.stringify(snapshot.panelPosition));
+          writes.push(await pdaStorageSet(PDA_PANEL_POSITION_STORE, JSON.stringify(snapshot.panelPosition)));
+        }
+        if (writes.some(ok => !ok) && lastPdaUiSnapshotJson === snapshotJson) {
+          lastPdaUiSnapshotJson = '';
         }
       });
   }
@@ -497,6 +520,32 @@
     };
   }
 
+  const SHARED_SECTION_KEYS = [
+    'schemaVersion', 'roster', 'manualNextHit', 'template',
+    'ui', 'ledger', 'api', 'history', 'runtime'
+  ];
+
+  function sharedSectionJson(snapshot) {
+    const sections = {};
+    for (const key of SHARED_SECTION_KEYS) sections[key] = JSON.stringify(snapshot?.[key]);
+    return sections;
+  }
+
+  function rememberPublishedSnapshot(snapshot) {
+    lastPublishedSectionJson = sharedSectionJson(snapshot);
+  }
+
+  function buildSharedDelta(snapshot, force = false) {
+    const nextSections = sharedSectionJson(snapshot);
+    const delta = {};
+    for (const key of SHARED_SECTION_KEYS) {
+      if (force || nextSections[key] !== lastPublishedSectionJson[key]) {
+        delta[key] = snapshot[key];
+      }
+    }
+    return delta;
+  }
+
   function sharedStampIsNewer(envelope) {
     const updatedAt = Number(envelope?.updatedAt) || 0;
     const sourceId = String(envelope?.sourceId || '');
@@ -536,26 +585,36 @@
     const snapshotJson = JSON.stringify(snapshot);
     if (!force && snapshotJson === lastPublishedSharedJson) return;
 
-    const envelope = {
-      type: 'state',
+    const stamp = {
       sourceId: TAB_ID,
       updatedAt: Date.now(),
-      sequence: ++sharedSequence,
-      snapshot
+      sequence: ++sharedSequence
     };
-    lastPublishedSharedJson = snapshotJson;
-    recordSharedStamp(envelope);
+    const fullEnvelope = { type: 'state', ...stamp, snapshot };
+    const delta = buildSharedDelta(snapshot, force || !lastPublishedSharedJson);
+    const broadcastEnvelope = force || !lastPublishedSharedJson
+      ? fullEnvelope
+      : { type: 'state-delta', ...stamp, snapshot: delta };
 
-    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(envelope)); }
+    lastPublishedSharedJson = snapshotJson;
+    rememberPublishedSnapshot(snapshot);
+    recordSharedStamp(fullEnvelope);
+
+    // Keep one full snapshot in storage for new tabs and as the no-BroadcastChannel fallback.
+    try { localStorage.setItem(TAB_SHARED_STATE_STORE, JSON.stringify(fullEnvelope)); }
     catch (error) { console.warn('[Merc-C-Que] Shared-state save failed:', error); }
-    try { syncChannel?.postMessage(envelope); } catch {}
+
+    // Active tabs normally receive only the sections that changed.
+    try { syncChannel?.postMessage(broadcastEnvelope); } catch {}
   }
 
   function applySharedEnvelope(envelope) {
-    if (!envelope || envelope.type !== 'state' || envelope.sourceId === TAB_ID) return false;
+    if (!envelope || !['state', 'state-delta'].includes(envelope.type) || envelope.sourceId === TAB_ID) return false;
     if (!sharedStampIsNewer(envelope)) return false;
     const shared = envelope.snapshot;
     if (!shared || typeof shared !== 'object') return false;
+    const isDelta = envelope.type === 'state-delta';
+    const has = key => !isDelta || Object.prototype.hasOwnProperty.call(shared, key);
 
     const rosterBefore = JSON.stringify(state.roster);
     const templateBefore = state.template;
@@ -565,27 +624,36 @@
     const lastAttackPoll = state.api.lastAttackPoll;
     const lastChainPoll = state.api.lastChainPoll;
 
-    state.roster = Array.isArray(shared.roster) ? shared.roster.map(normalizeParticipant) : state.roster;
-    state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
-    state.template = typeof shared.template === 'string' ? shared.template : state.template;
-    state.ui = { ...state.ui, ...(shared.ui || {}) };
-    state.ledger = normalizeLedger(shared.ledger);
-    state.api = normalizeApi({
-      ...state.api,
-      ...(shared.api || {}),
-      lastAttackPoll,
-      lastChainPoll
-    });
-    history = Array.isArray(shared.history) ? shared.history.slice(-MAX_HISTORY) : history;
+    if (has('schemaVersion')) state.schemaVersion = Number(shared.schemaVersion) || state.schemaVersion;
+    if (has('roster') && Array.isArray(shared.roster)) {
+      state.roster = shared.roster.map(normalizeParticipant);
+    }
+    if (has('manualNextHit')) state.manualNextHit = Math.max(1, Number(shared.manualNextHit) || 1);
+    if (has('template') && typeof shared.template === 'string') state.template = shared.template;
+    if (has('ui')) state.ui = { ...state.ui, ...(shared.ui || {}) };
+    if (has('ledger')) state.ledger = normalizeLedger(shared.ledger);
+    if (has('api')) {
+      state.api = normalizeApi({
+        ...state.api,
+        ...(shared.api || {}),
+        lastAttackPoll,
+        lastChainPoll
+      });
+    }
+    if (has('history') && Array.isArray(shared.history)) {
+      history = shared.history.slice(-MAX_HISTORY);
+    }
 
-    const runtime = shared.runtime || {};
-    lastUpName = String(runtime.lastUpName || '');
-    upSince = Number(runtime.upSince) || Date.now();
-    tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
-    tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
-    chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
-    dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
-    criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+    if (has('runtime')) {
+      const runtime = shared.runtime || {};
+      lastUpName = String(runtime.lastUpName || '');
+      upSince = Number(runtime.upSince) || Date.now();
+      tornClockOffsetMs = Number(runtime.tornClockOffsetMs) || 0;
+      tornClockSyncedAt = Number(runtime.tornClockSyncedAt) || 0;
+      chainDeadlineTornMs = Number(runtime.chainDeadlineTornMs) || 0;
+      dangerAlertedForHit = runtime.dangerAlertedForHit ?? null;
+      criticalAlertedForHit = runtime.criticalAlertedForHit ?? null;
+    }
 
     const rosterChanged = JSON.stringify(state.roster) !== rosterBefore;
     const templateChanged = state.template !== templateBefore;
@@ -599,9 +667,20 @@
     );
 
     recordSharedStamp(envelope);
-    lastPublishedSharedJson = JSON.stringify(buildSharedSnapshot());
+    const currentSnapshot = buildSharedSnapshot();
+    lastPublishedSharedJson = JSON.stringify(currentSnapshot);
+    rememberPublishedSnapshot(currentSnapshot);
     refresh({ roster: rosterChanged, settings: settingsChanged });
     return true;
+  }
+
+  function applyStoredSharedState() {
+    try {
+      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
+      return raw ? applySharedEnvelope(JSON.parse(raw)) : false;
+    } catch {
+      return false;
+    }
   }
 
   function initTabSync() {
@@ -617,15 +696,12 @@
 
     window.addEventListener('storage', event => {
       if (event.key !== TAB_SHARED_STATE_STORE || !event.newValue) return;
+      // BroadcastChannel is the lighter primary path. Storage remains the fallback/bootstrap snapshot.
+      if (syncChannel) return;
       try { applySharedEnvelope(JSON.parse(event.newValue)); } catch {}
     });
 
-    let existing = null;
-    try {
-      const raw = localStorage.getItem(TAB_SHARED_STATE_STORE);
-      if (raw) existing = JSON.parse(raw);
-    } catch {}
-    if (!applySharedEnvelope(existing)) publishSharedState(true);
+    if (!applyStoredSharedState()) publishSharedState(true);
   }
 
   function readApiLeaderLease() {
@@ -782,11 +858,15 @@
     return !!getEffectiveApiKey();
   }
 
-  function pushHistory(reason = 'queue change', meta = {}) {
-    history.push({
-      reason, meta: clone(meta), roster: clone(state.roster),
-      manualNextHit: state.manualNextHit, ledger: clone(state.ledger)
-    });
+  function pushHistory(reason = 'queue change', meta = {}, { captureLedger = false } = {}) {
+    const entry = {
+      reason,
+      meta: clone(meta),
+      roster: clone(state.roster),
+      manualNextHit: state.manualNextHit
+    };
+    if (captureLedger) entry.ledger = clone(state.ledger);
+    history.push(entry);
     if (history.length > MAX_HISTORY) history.shift();
   }
 
@@ -795,15 +875,19 @@
     const previous = history.pop();
     state.roster = previous.roster;
     state.manualNextHit = previous.manualNextHit;
-    state.ledger = previous.ledger;
-    if (previous.meta?.attackId) {
-      const existing = state.ledger.find(x => String(x.id) === String(previous.meta.attackId));
+    if (Array.isArray(previous.ledger)) state.ledger = previous.ledger;
+    const undoLedgerIds = new Set([
+      previous.meta?.attackId,
+      ...(Array.isArray(previous.meta?.ledgerIds) ? previous.meta.ledgerIds : [])
+    ].filter(Boolean).map(String));
+    for (const ledgerId of undoLedgerIds) {
+      const existing = state.ledger.find(x => String(x.id) === ledgerId);
       if (existing) {
         existing.undone = true;
         existing.action = 'undone';
-      } else {
+      } else if (String(previous.meta?.attackId || '') === ledgerId) {
         state.ledger.unshift({
-          id: String(previous.meta.attackId),
+          id: ledgerId,
           attacker: String(previous.meta.attacker || 'Unknown'),
           chain: Number(previous.meta.chain) || 0,
           kind: String(previous.meta.kind || 'expected'),
@@ -880,11 +964,12 @@
     if (state.api.mode !== 'manual') return toast('Switch API Mode to Manual before using DONE.');
     const index = currentIndex();
     if (index < 0) return toast('No READY participant.');
-    pushHistory('manual DONE');
+    const ledgerId = `manual-${Date.now()}`;
+    pushHistory('manual DONE', { ledgerIds: [ledgerId] });
     const participant = sendToBack(index, true);
     state.manualNextHit = nextHitNumber() + 1;
     addLedger({
-      id: `manual-${Date.now()}`, attacker: participant.name,
+      id: ledgerId, attacker: participant.name,
       chain: state.manualNextHit - 1, kind: 'manual',
       expected: true, mode: 'manual', action: 'manual-recorded'
     });
@@ -964,7 +1049,7 @@
 
   function resetSession() {
     if (!confirm('Reset player hit counts, manual hit number, API pending notices, and set everyone READY? Roster order will stay the same.')) return;
-    pushHistory('reset session');
+    pushHistory('reset session', {}, { captureLedger: true });
     state.roster.forEach(p => { p.hits = 0; p.status = 'ready'; });
     state.manualNextHit = 1;
     state.api.pendingHits = [];
@@ -1200,9 +1285,10 @@
   }
 
   function addPendingHit(event) {
-    if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return;
+    if (state.api.pendingHits.some(item => String(item.id) === String(event.id))) return true;
+    if (state.api.pendingHits.length >= MAX_PENDING) return false;
     state.api.pendingHits.push(event);
-    state.api.pendingHits = state.api.pendingHits.slice(0, MAX_PENDING);
+    return true;
   }
 
   const hasSyncError = () =>
@@ -1308,7 +1394,15 @@
       state.api.status = `AUTO: ${attacker} recorded at #${chain}`;
       return true;
     }
-    addPendingHit(event);
+    if (!addPendingHit(event)) {
+      updateLedgerAction(id, 'pending-capacity-paused');
+      state.api.paused = true;
+      state.api.status = `Pending backlog reached ${MAX_PENDING} — automation paused before dropping a hit`;
+      state.api.reconciliationNote =
+        `Pending capacity reached before hit #${chain} by ${attacker}. Clear the backlog, then RESUME API to reconcile safely.`;
+      toast(`Pending backlog reached ${MAX_PENDING}. API automation paused before losing a hit.`);
+      return 'pending-full';
+    }
     updateLedgerAction(id, 'pending');
     if (index < 0) state.api.status = `Hit #${chain}: ${attacker} is not in the queue`;
     else if (expected) state.api.status = `Hit #${chain} detected — awaiting confirmation`;
@@ -1357,12 +1451,17 @@
 
       let changed = false;
       for (const { attack, id } of fresh) {
+        const result = processDetectedAttack(attack);
+        if (result === 'pending-full') {
+          changed = true;
+          break;
+        }
         markProcessed(id);
-        if (processDetectedAttack(attack)) changed = true;
+        if (result) changed = true;
       }
 
       if (!fresh.length) state.api.status = 'Connected — watching new faction hits';
-      if (reconciliation) {
+      if (reconciliation && !state.api.paused) {
         state.api.reconciliationNote = fresh.length
           ? `Reconciled ${fresh.length} new attack${fresh.length === 1 ? '' : 's'} after resume.`
           : 'Resume reconciliation complete — no missed attacks found.';
@@ -1474,6 +1573,7 @@
   async function reconcileAfterResume(reason = 'resume') {
     if (reconciliationInFlight || !automationActive()) return;
     if (!maintainApiLeadership()) {
+      applyStoredSharedState();
       refresh({ settings: true });
       return;
     }
@@ -1636,7 +1736,9 @@
       (Number(a.chain) - Number(b.chain)) ||
       String(a.id).localeCompare(String(b.id))
     );
-    pushHistory(`record all ${count} pending hits`);
+    pushHistory(`record all ${count} pending hits`, {
+      ledgerIds: pending.map(event => String(event.id))
+    });
 
     let added = 0;
     for (const event of pending) {
@@ -1850,6 +1952,39 @@
     };
   }
 
+  function captureAnchoredPosition(element, clampFn) {
+    const rect = element.getBoundingClientRect();
+    const clamped = clampFn(rect.left, rect.top, element);
+    const rightGap = Math.max(0, window.innerWidth - (clamped.left + element.offsetWidth));
+    const leftGap = Math.max(0, clamped.left);
+    const anchorX = rightGap < leftGap ? 'right' : 'left';
+    return {
+      left: Math.round(clamped.left),
+      top: Math.round(clamped.top),
+      anchorX,
+      offsetX: Math.round(anchorX === 'right' ? rightGap : leftGap)
+    };
+  }
+
+  function resolveAnchoredPosition(saved, element, clampFn) {
+    const normalized = normalizeStoredPosition(saved);
+    if (!normalized) return null;
+    let left = normalized.left;
+    if (normalized.anchorX === 'right' && Number.isFinite(Number(normalized.offsetX))) {
+      left = window.innerWidth - element.offsetWidth - Number(normalized.offsetX);
+    } else if (normalized.anchorX === 'left' && Number.isFinite(Number(normalized.offsetX))) {
+      left = Number(normalized.offsetX);
+    }
+    return clampFn(left, normalized.top, element);
+  }
+
+  function upgradePositionAnchor(saved, element, clampFn) {
+    const normalized = normalizeStoredPosition(saved);
+    if (!normalized || normalized.anchorX) return normalized;
+    setPosition(element, clampFn(normalized.left, normalized.top, element));
+    return captureAnchoredPosition(element, clampFn);
+  }
+
   function adjustPanelViewport() {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
@@ -1860,8 +1995,7 @@
   function minimizeApp() {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
-      const rect = panel.getBoundingClientRect();
-      state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
+      state.position = captureAnchoredPosition(panel, clampPanelPosition);
     }
     state.minimized = true;
     saveLocalNow();
@@ -2133,10 +2267,17 @@
   }
 
   function applyPanelPosition(panel) {
-    if (state.position && Number.isFinite(Number(state.position.left)) && Number.isFinite(Number(state.position.top))) {
-      setPosition(panel, clampPanelPosition(Number(state.position.left), Number(state.position.top), panel));
-      panel.style.right = 'auto';
+    const normalized = normalizeStoredPosition(state.position);
+    if (!normalized) return;
+    const upgraded = upgradePositionAnchor(normalized, panel, clampPanelPosition);
+    if (upgraded && !normalized.anchorX) {
+      state.position = upgraded;
+      saveLocalSoon();
     }
+    const position = resolveAnchoredPosition(state.position, panel, clampPanelPosition);
+    if (!position) return;
+    setPosition(panel, position);
+    panel.style.right = 'auto';
   }
 
   function renderSettings() {
@@ -2264,10 +2405,21 @@
       ${IS_PDA ? '<span class="launcherClose" data-launcher-close="1" role="button" aria-label="Hide Merc-C-Que for this session" title="Hide Merc-C-Que for this session">×</span>' : ''}
       ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
     launcher.title = `Merc-C-Que — ${label} — ${state.api.status || state.api.mode}`;
-    const saved = state.launcherPosition;
-    const initial = saved && Number.isFinite(Number(saved.left)) && Number.isFinite(Number(saved.top))
-      ? { left: Number(saved.left), top: Number(saved.top) } : defaultLauncherPosition();
-    setPosition(launcher, clampLauncherPosition(initial.left, initial.top, launcher));
+    const saved = normalizeStoredPosition(state.launcherPosition);
+    if (saved) {
+      const upgraded = upgradePositionAnchor(saved, launcher, clampLauncherPosition);
+      if (upgraded && !saved.anchorX) {
+        state.launcherPosition = upgraded;
+        saveLocalSoon();
+      }
+      const position = resolveAnchoredPosition(state.launcherPosition, launcher, clampLauncherPosition);
+      if (position) setPosition(launcher, position);
+    } else {
+      const fallback = defaultLauncherPosition();
+      setPosition(launcher, clampLauncherPosition(fallback.left, fallback.top, launcher));
+      state.launcherPosition = captureAnchoredPosition(launcher, clampLauncherPosition);
+      saveLocalSoon();
+    }
     launcher.style.right = 'auto';
     launcher.style.bottom = 'auto';
   }
@@ -2513,8 +2665,7 @@
     if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        const rect = panel.getBoundingClientRect();
-        state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
+        state.position = captureAnchoredPosition(panel, clampPanelPosition);
         saveLocalNow();
         adjustPanelViewport();
       }
@@ -2523,8 +2674,7 @@
     if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
-        const rect = launcher.getBoundingClientRect();
-        state.launcherPosition = { left: Math.round(rect.left), top: Math.round(rect.top) };
+        state.launcherPosition = captureAnchoredPosition(launcher, clampLauncherPosition);
         saveLocalNow();
       }
       if (launcherDrag.moved) suppressLauncherClickUntil = Date.now() + 250;
@@ -2552,20 +2702,15 @@
   window.addEventListener('resize', () => {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
-      const rect = panel.getBoundingClientRect();
-      const position = clampPanelPosition(rect.left, rect.top, panel);
-      setPosition(panel, position);
-      state.position = { left: Math.round(position.left), top: Math.round(position.top) };
+      const position = resolveAnchoredPosition(state.position, panel, clampPanelPosition);
+      if (position) setPosition(panel, position);
       adjustPanelViewport();
     }
     const launcher = document.getElementById(LAUNCHER_ID);
     if (launcher) {
-      const rect = launcher.getBoundingClientRect();
-      const position = clampLauncherPosition(rect.left, rect.top, launcher);
-      setPosition(launcher, position);
-      state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
+      const position = resolveAnchoredPosition(state.launcherPosition, launcher, clampLauncherPosition);
+      if (position) setPosition(launcher, position);
     }
-    saveLocalSoon();
   });
 
   function toast(message) {
