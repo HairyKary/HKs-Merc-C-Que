@@ -5,9 +5,47 @@
 HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitters, track who is up next, and generate a quick faction-chat readout.
 
 > **Status:** Public Release  
-> **Current version:** v2.5.14
+> **Current version:** v2.5.14  
 > Tested on desktop/Tampermonkey and Torn PDA.  
 > This is an unofficial community userscript and is not affiliated with Torn Ltd.
+
+## Install MCQ
+
+### [⬇ INSTALL HKs MERC-C-QUE](https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js)
+
+**Share this one link with faction members:**  
+`https://github.com/HairyKary/HKs-Merc-C-Que`
+
+### Desktop / PC
+
+1. Install **Tampermonkey** in your browser.
+2. Click **INSTALL HKs MERC-C-QUE** above.
+3. Tampermonkey should open its userscript install screen.
+4. Click **Install**.
+5. Reload Torn.
+6. Open MCQ → **Settings → API** and use your own Torn API key if you want Assisted or Auto mode.
+
+### Torn PDA
+
+1. Open this GitHub page inside Torn PDA.
+2. Tap **INSTALL HKs MERC-C-QUE** above.
+3. If Torn PDA offers to install/import the `.user.js` file, accept it.
+
+If it does not prompt automatically:
+
+1. Copy the install link.
+2. Open **Torn PDA → Settings → Advanced browser settings → Manage scripts**.
+3. Tap **+**, then **Configure**.
+4. Paste the install URL into **Remote URL**.
+5. Tap **Fetch**, then **Load**, then **Add**.
+
+Torn PDA supplies its own injected API key to MCQ when available.
+
+### Already installed?
+
+You do **not** need a new link for future releases. MCQ's updater points to the production `main` branch, so compatible userscript managers can check the same install URL for updates.
+
+---
 
 ## Features
 
@@ -56,21 +94,12 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 - Edge-anchored panel and launcher positions that remain attached to the chosen side when the browser is resized
 - Optional warning when the same player remains UP too long
 
-## Installation
+## Installation Notes
 
-### Requirements
+The quickest installation steps are at the top of this page.
 
-- Desktop: a userscript manager such as **Tampermonkey**
-- Mobile: **Torn PDA** with userscript support
-- Torn.com account
-- Optional: a Torn API key with the permissions required for faction attack data
-
-### Install from GitHub
-
-1. Open the raw userscript:  
-   `https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
-2. Install it with Tampermonkey or Torn PDA.
-3. Refresh/reopen Torn.
+Direct production userscript:
+`https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
 
 Desktop installs include automatic update metadata pointing to the `main` branch.
 
