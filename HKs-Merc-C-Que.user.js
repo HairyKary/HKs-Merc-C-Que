@@ -2415,11 +2415,10 @@
       const position = resolveAnchoredPosition(state.launcherPosition, launcher, clampLauncherPosition);
       if (position) setPosition(launcher, position);
     } else {
-      setPosition(launcher, clampLauncherPosition(
-        defaultLauncherPosition().left,
-        defaultLauncherPosition().top,
-        launcher
-      ));
+      const fallback = defaultLauncherPosition();
+      setPosition(launcher, clampLauncherPosition(fallback.left, fallback.top, launcher));
+      state.launcherPosition = captureAnchoredPosition(launcher, clampLauncherPosition);
+      saveLocalSoon();
     }
     launcher.style.right = 'auto';
     launcher.style.bottom = 'auto';
