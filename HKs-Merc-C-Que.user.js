@@ -213,7 +213,14 @@
       const left = Number(parsed?.left);
       const top = Number(parsed?.top);
       if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
-      return { left: Math.round(left), top: Math.round(top) };
+      const position = { left: Math.round(left), top: Math.round(top) };
+      const anchorX = parsed?.anchorX;
+      const offsetX = Number(parsed?.offsetX);
+      if ((anchorX === 'left' || anchorX === 'right') && Number.isFinite(offsetX)) {
+        position.anchorX = anchorX;
+        position.offsetX = Math.max(0, Math.round(offsetX));
+      }
+      return position;
     } catch {
       return null;
     }
@@ -1945,6 +1952,39 @@
     };
   }
 
+  function captureAnchoredPosition(element, clampFn) {
+    const rect = element.getBoundingClientRect();
+    const clamped = clampFn(rect.left, rect.top, element);
+    const rightGap = Math.max(0, window.innerWidth - (clamped.left + element.offsetWidth));
+    const leftGap = Math.max(0, clamped.left);
+    const anchorX = rightGap < leftGap ? 'right' : 'left';
+    return {
+      left: Math.round(clamped.left),
+      top: Math.round(clamped.top),
+      anchorX,
+      offsetX: Math.round(anchorX === 'right' ? rightGap : leftGap)
+    };
+  }
+
+  function resolveAnchoredPosition(saved, element, clampFn) {
+    const normalized = normalizeStoredPosition(saved);
+    if (!normalized) return null;
+    let left = normalized.left;
+    if (normalized.anchorX === 'right' && Number.isFinite(Number(normalized.offsetX))) {
+      left = window.innerWidth - element.offsetWidth - Number(normalized.offsetX);
+    } else if (normalized.anchorX === 'left' && Number.isFinite(Number(normalized.offsetX))) {
+      left = Number(normalized.offsetX);
+    }
+    return clampFn(left, normalized.top, element);
+  }
+
+  function upgradePositionAnchor(saved, element, clampFn) {
+    const normalized = normalizeStoredPosition(saved);
+    if (!normalized || normalized.anchorX) return normalized;
+    setPosition(element, clampFn(normalized.left, normalized.top, element));
+    return captureAnchoredPosition(element, clampFn);
+  }
+
   function adjustPanelViewport() {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
@@ -1955,8 +1995,7 @@
   function minimizeApp() {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
-      const rect = panel.getBoundingClientRect();
-      state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
+      state.position = captureAnchoredPosition(panel, clampPanelPosition);
     }
     state.minimized = true;
     saveLocalNow();
@@ -2228,10 +2267,17 @@
   }
 
   function applyPanelPosition(panel) {
-    if (state.position && Number.isFinite(Number(state.position.left)) && Number.isFinite(Number(state.position.top))) {
-      setPosition(panel, clampPanelPosition(Number(state.position.left), Number(state.position.top), panel));
-      panel.style.right = 'auto';
+    const normalized = normalizeStoredPosition(state.position);
+    if (!normalized) return;
+    const upgraded = upgradePositionAnchor(normalized, panel, clampPanelPosition);
+    if (upgraded && !normalized.anchorX) {
+      state.position = upgraded;
+      saveLocalSoon();
     }
+    const position = resolveAnchoredPosition(state.position, panel, clampPanelPosition);
+    if (!position) return;
+    setPosition(panel, position);
+    panel.style.right = 'auto';
   }
 
   function renderSettings() {
@@ -2359,10 +2405,22 @@
       ${IS_PDA ? '<span class="launcherClose" data-launcher-close="1" role="button" aria-label="Hide Merc-C-Que for this session" title="Hide Merc-C-Que for this session">×</span>' : ''}
       ${pendingCount > 0 ? `<span class="launcherBadge" title="${pendingCount} hit${pendingCount === 1 ? '' : 's'} waiting for attention">${pendingCount > 99 ? '99+' : pendingCount}</span>` : ''}`;
     launcher.title = `Merc-C-Que — ${label} — ${state.api.status || state.api.mode}`;
-    const saved = state.launcherPosition;
-    const initial = saved && Number.isFinite(Number(saved.left)) && Number.isFinite(Number(saved.top))
-      ? { left: Number(saved.left), top: Number(saved.top) } : defaultLauncherPosition();
-    setPosition(launcher, clampLauncherPosition(initial.left, initial.top, launcher));
+    const saved = normalizeStoredPosition(state.launcherPosition);
+    if (saved) {
+      const upgraded = upgradePositionAnchor(saved, launcher, clampLauncherPosition);
+      if (upgraded && !saved.anchorX) {
+        state.launcherPosition = upgraded;
+        saveLocalSoon();
+      }
+      const position = resolveAnchoredPosition(state.launcherPosition, launcher, clampLauncherPosition);
+      if (position) setPosition(launcher, position);
+    } else {
+      setPosition(launcher, clampLauncherPosition(
+        defaultLauncherPosition().left,
+        defaultLauncherPosition().top,
+        launcher
+      ));
+    }
     launcher.style.right = 'auto';
     launcher.style.bottom = 'auto';
   }
@@ -2608,8 +2666,7 @@
     if (panelDrag && event.pointerId === panelDrag.pointerId) {
       const panel = document.getElementById(PANEL_ID);
       if (panel) {
-        const rect = panel.getBoundingClientRect();
-        state.position = { left: Math.round(rect.left), top: Math.round(rect.top) };
+        state.position = captureAnchoredPosition(panel, clampPanelPosition);
         saveLocalNow();
         adjustPanelViewport();
       }
@@ -2618,8 +2675,7 @@
     if (launcherDrag && event.pointerId === launcherDrag.pointerId) {
       const launcher = document.getElementById(LAUNCHER_ID);
       if (launcher) {
-        const rect = launcher.getBoundingClientRect();
-        state.launcherPosition = { left: Math.round(rect.left), top: Math.round(rect.top) };
+        state.launcherPosition = captureAnchoredPosition(launcher, clampLauncherPosition);
         saveLocalNow();
       }
       if (launcherDrag.moved) suppressLauncherClickUntil = Date.now() + 250;
@@ -2647,20 +2703,15 @@
   window.addEventListener('resize', () => {
     const panel = document.getElementById(PANEL_ID);
     if (panel) {
-      const rect = panel.getBoundingClientRect();
-      const position = clampPanelPosition(rect.left, rect.top, panel);
-      setPosition(panel, position);
-      state.position = { left: Math.round(position.left), top: Math.round(position.top) };
+      const position = resolveAnchoredPosition(state.position, panel, clampPanelPosition);
+      if (position) setPosition(panel, position);
       adjustPanelViewport();
     }
     const launcher = document.getElementById(LAUNCHER_ID);
     if (launcher) {
-      const rect = launcher.getBoundingClientRect();
-      const position = clampLauncherPosition(rect.left, rect.top, launcher);
-      setPosition(launcher, position);
-      state.launcherPosition = { left: Math.round(position.left), top: Math.round(position.top) };
+      const position = resolveAnchoredPosition(state.launcherPosition, launcher, clampLauncherPosition);
+      if (position) setPosition(launcher, position);
     }
-    saveLocalSoon();
   });
 
   function toast(message) {
