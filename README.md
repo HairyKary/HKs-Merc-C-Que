@@ -219,7 +219,10 @@ Open a GitHub Issue and include:
 
 **Remove private information before posting screenshots or logs. The built-in debug snapshot does not include your saved API key.**
 
-## Disclaimer
+## License
+
+HKs Merc-C-Que is released under the [MIT License](LICENSE).
+
 
 This is an unofficial third-party userscript. Torn API behavior and page structure may change and can affect script functionality.
 
