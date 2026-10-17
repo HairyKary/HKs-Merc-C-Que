@@ -11,7 +11,7 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 
 ## Install MCQ
 
-### [⬇ INSTALL HKs MERC-C-QUE](https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js)
+### [⬇ INSTALL HKs MERC-C-QUE](https://greasyfork.org/en/scripts/600748-hks-merc-c-que)
 
 **Share this one link with faction members:**  
 `https://github.com/HairyKary/HKs-Merc-C-Que`
@@ -20,30 +20,30 @@ HKs Merc-C-Que helps faction chain coordinators keep an ordered rotation of hitt
 
 1. Install **Tampermonkey** in your browser.
 2. Click **INSTALL HKs MERC-C-QUE** above.
-3. Tampermonkey should open its userscript install screen.
-4. Click **Install**.
-5. Reload Torn.
-6. Open MCQ → **Settings → API** and use your own Torn API key if you want Assisted or Auto mode.
+3. On Greasy Fork, click **Install this script**.
+4. Tampermonkey should open its userscript install screen.
+5. Click **Install**.
+6. Reload Torn.
+7. Open MCQ → **Settings → API** and use your own Torn API key if you want Assisted or Auto mode.
 
 ### Torn PDA
 
 1. Open this GitHub page inside Torn PDA.
 2. Tap **INSTALL HKs MERC-C-QUE** above.
-3. If Torn PDA offers to install/import the `.user.js` file, accept it.
+3. On Greasy Fork, tap **Install this script**.
+4. If Torn PDA offers to install/import the `.user.js` file, accept it.
 
-If it does not prompt automatically:
+If Greasy Fork does not trigger the install automatically, use the direct GitHub install URL below:
 
-1. Copy the install link.
-2. Open **Torn PDA → Settings → Advanced browser settings → Manage scripts**.
-3. Tap **+**, then **Configure**.
-4. Paste the install URL into **Remote URL**.
-5. Tap **Fetch**, then **Load**, then **Add**.
+`https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
+
+Then open **Torn PDA → Settings → Advanced browser settings → Manage scripts**, tap **+ → Configure**, paste the URL into **Remote URL**, then tap **Fetch → Load → Add**.
 
 Torn PDA supplies its own injected API key to MCQ when available.
 
 ### Already installed?
 
-You do **not** need a new link for future releases. MCQ's updater points to the production `main` branch, so compatible userscript managers can check the same install URL for updates.
+You do **not** need a new link for future releases. Greasy Fork installs receive updates through Greasy Fork. Direct GitHub installs continue to use the production `main` branch for updates.
 
 ---
 
@@ -98,10 +98,13 @@ You do **not** need a new link for future releases. MCQ's updater points to the 
 
 The quickest installation steps are at the top of this page.
 
-Direct production userscript:
+**Recommended public install:**  
+https://greasyfork.org/en/scripts/600748-hks-merc-c-que
+
+**Direct GitHub install / alternate:**  
 `https://raw.githubusercontent.com/HairyKary/HKs-Merc-C-Que/main/HKs-Merc-C-Que.user.js`
 
-Desktop installs include automatic update metadata pointing to the `main` branch.
+Greasy Fork installs receive updates through Greasy Fork. Direct GitHub installs use the userscript update metadata pointing to the production `main` branch.
 
 ## First Setup
 
